@@ -1,0 +1,18 @@
+# TEMPLATE — import into HA and point the CAPITALIZED placeholders at your entities.
+alias: Smart Puck — Person at door porthole
+description: >-
+  Person detection -> the puck shows the camera frame. Name porthole automations with
+  'porthole' in the name: the alert-mirror automation suppresses its text modal for 20s
+  after any *porthole* automation fires, so the PICTURE keeps the screen instead of being
+  overwritten by its own text description.
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.YOUR_PERSON_SENSOR
+    from: "off"
+    to: "on"
+actions:
+  - action: esphome.smart_puck_show_camera
+    data: {camera: "YOUR_FRIGATE_CAMERA", title: "Person at the door"}
+  - delay: {minutes: 2}
+mode: single
+max_exceeded: silent

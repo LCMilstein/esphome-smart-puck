@@ -33,6 +33,9 @@ triggers:
     domain: notify
 conditions:
 - condition: template
+  value_template: >-
+    {% set ns = namespace(recent=false) %}{% for a in states.automation if 'porthole' in a.entity_id %}{% if a.attributes.last_triggered and (now() - a.attributes.last_triggered).total_seconds() < 20 %}{% set ns.recent = true %}{% endif %}{% endfor %}{{ not ns.recent }}
+- condition: template
   value_template: '{{ ''YOUR_NAME'' in (trigger.event.data.service | default('''') | lower) }}'
 - condition: template
   value_template: '{% set m = trigger.event.data.service_data.message | default('''') | string %}{{ m

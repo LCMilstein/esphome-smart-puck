@@ -31,6 +31,11 @@ custom firmware toolchain — one YAML file.
   leading edge is the room, the white tick is the target, and heating rises clockwise while
   cooling descends counter-clockwise. Media page shows album art with a track-progress ring.
 
+- **Side button (BOOT)** — the button furthest from USB-C: click = push-to-talk (no wake
+  word), click again = cancel, double-click = dismiss any modal, long-press = voice volume
+  cycle with an on-screen toast (persisted across reboots). The USB-C-side button is RESET.
+- **Media idle art** — a vinyl record fills the round display when nothing plays.
+
 ## Hardware
 
 - [Waveshare ESP32-S3-Touch-LCD-1.85C](https://www.waveshare.com/esp32-s3-touch-lcd-1.85c.htm)

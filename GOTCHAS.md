@@ -50,3 +50,6 @@ automations. Changing policy must never require an OTA.
 | Pirate Weather AQI | `airQualityIndex`/`smoke` exist only with **`?version=2`**; the HA integration exposes neither. `fireIndex` is fire danger, not smoke. |
 | ESPHome CLI in Docker | Compile/logs containers probe the dashboard healthcheck → always "unhealthy"; it's a false positive. Builds leave root-owned files in `.esphome/`. |
 | Blocking `docker run` in a service | bash can't act on SIGTERM while blocked → systemd SIGKILLs and **orphans the container** (a 2nd log attach corrupts the capture). Fixed `--name` + `ExecStop=docker rm -f <name>`. |
+| Rounded arc caps bridge gaps | LVGL arcs default to ROUNDED end caps; at large radius the caps visually bridge small inter-segment gaps and a segmented ring reads as solid. `arc_rounded: false` — also skips endcap anti-aliasing. |
+| Feels laggy | Check compiler first: ESPHome esp-idf defaults to `compiler_optimization: SIZE`; `PERF` (-O2) bought this device's LVGL loop back 20% for 2.5% flash. Then shorten page-slide animations — full-page redraws per frame dominate perceived lag. |
+| One assignable button | On this board BOOT (GPIO0) is a free runtime input (click/double/long via `on_multi_click`); the other button is RESET/power — firmware never sees it. Design for one button, not two. |

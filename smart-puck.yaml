@@ -55,6 +55,12 @@ esp32:
   flash_size: 16MB
   framework:
     type: esp-idf
+    # PERF (-O2) over the SIZE default: the user wanted snappier paints after the ring grew to the
+    # bezel (loop 43->50ms). LVGL's software renderer is exactly the hot loop -O2 helps.
+    # Cost is binary size only -- we sit at 59% of a 7.75MB slot, so headroom is the point of
+    # having it. Revert = delete these two lines.
+    advanced:
+      compiler_optimization: PERF
     sdkconfig_options:
       CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
@@ -89,6 +95,9 @@ api:
         condition: {lambda: 'return id(office_occupancy).state;'}
         then: [{light.turn_on: {id: backlight, brightness: 80%, transition_length: 800ms}}]
         else: [{light.turn_on: {id: backlight, brightness: 12%, transition_length: 1500ms}}]
+    - speaker.volume_set:
+        id: i2s_speaker
+        volume: !lambda 'return id(spk_vol);'
     - micro_wake_word.start   # arm "Okay Nabu" once HA (Assist pipeline) is reachable
   # HA-callable actions. The puck is the passive side: HA decides WHAT is worth interrupting for
   # (doorbell press, an actionable notification) and calls in. Keeps policy in HA where the user can
@@ -338,7 +347,7 @@ text_sensor:
       - script.execute: layout_badges
       - if:   # media screen bg: keep album art while playing/paused, else revert to the glow
           condition: {lambda: 'return x != std::string("playing") && x != std::string("paused");'}
-          then: [{lvgl.image.update: {id: media_bg, src: bg_glow}}]
+          then: [{lvgl.image.update: {id: media_bg, src: music_idle}}]
   - platform: homeassistant
     id: media_title
     entity_id: "${media_player_native}"
@@ -566,6 +575,36 @@ binary_sensor:
   # Night behavior: no ambient-light sensor on this board, so drive the backlight from office
   # occupancy — full brightness when someone's there, dim when the room's empty (saves the panel,
   # no 2am glare). Fades so it's not jarring.
+  # ── BOOT side button (GPIO0) — the button FURTHEST from USB-C, nearest the user.
+  # (the user verified empirically 07-17: the USB-C-side button is RESET = hard reboot.)
+  # GPIO0 is the strapping/download pin, but as a momentary INPUT at runtime this is the
+  # vendor-intended dual use. click = push-to-talk toggle | double = dismiss | long = volume.
+  - platform: gpio
+    id: boot_button
+    pin:
+      number: GPIO0
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+      ignore_strapping_warning: true
+    on_multi_click:
+      - timing:
+          - ON for at most 400ms
+          - OFF for at least 330ms
+        then:
+          - script.execute: ptt_toggle
+      - timing:
+          - ON for at most 400ms
+          - OFF for at most 300ms
+          - ON for at most 400ms
+          - OFF for at least 200ms
+        then:
+          - script.execute: hard_dismiss
+      - timing:
+          - ON for at least 700ms
+        then:
+          - script.execute: cycle_voice_volume
   - platform: homeassistant
     id: package_waiting
     entity_id: input_boolean.package_waiting
@@ -779,6 +818,10 @@ image:
   - {file: backgrounds/bg_cool.png,     id: tm_cool,     type: RGB565}
   - {file: backgrounds/bg_heatcool.png, id: tm_heatcool, type: RGB565}
   - {file: backgrounds/bg_off.png,      id: tm_off,      type: RGB565}
+  # media page IDLE background — a vinyl record (the thing that's actually round and
+  # trademark-free; Sonos/Spotify imagery would poison the public repo). Generated in the
+  # same dark-vignette style as the weather art.
+  - {file: backgrounds/bg_music_idle.png, id: music_idle, type: RGB565}
   # voice view background (neural network, Gemini) — calm dark center for the orb + text
   - {file: backgrounds/voice_neural.png, id: neural_bg,  type: RGB565}
 
@@ -1245,7 +1288,7 @@ touchscreen:
       - if:   # TOP HALF -> next screen
           condition: {lambda: 'return id(tap_zone) == 0;'}
           then:
-            - lvgl.page.next: {animation: MOVE_LEFT, time: 200ms}
+            - lvgl.page.next: {animation: MOVE_LEFT, time: 120ms}
       # ── THERMOSTAT screen: - / fan-toggle / + ──
       - if:
           condition:
@@ -1361,6 +1404,10 @@ globals:
     type: int             # (dismiss) and must not also navigate -- same contract as timer_done.
     restore_value: no
     initial_value: "0"
+  - id: spk_vol           # voice-reply volume step (BOOT long-press cycles 0.4/0.7/1.0).
+    type: float             # Persisted: your volume choice should survive a reboot.
+    restore_value: yes
+    initial_value: "0.7"
   - id: camera_title      # what the porthole scrim says — set by whichever HA action fired it
     type: std::string
     restore_value: no
@@ -1415,7 +1462,7 @@ script:
     mode: single
     then:
       - lambda: |-
-          // v3 (the user's model): the FILL's leading edge is the ROOM (current), the
+          // v3 (the user's model, ): the FILL's leading edge is the ROOM (current), the
           // white TICK is the GOAL (target), and the fill is anchored at the end the
           // temperature is COMING FROM — heat rises from the cold/left end clockwise, cooling
           // descends from the hot/right end counter-clockwise, each sweeping toward the tick
@@ -1448,6 +1495,61 @@ script:
             lv_arc_set_bg_angles(id(therm_now_tick), (a - 2 + 360) % 360, (a + 2) % 360);
             lv_obj_clear_flag(id(therm_now_tick), LV_OBJ_FLAG_HIDDEN);
           }
+
+  # ── BOOT BUTTON ACTIONS ─────────────────────────────────────────────────────────────────
+  # Push-to-talk TOGGLE: click to talk (no wake word — immune to music/acoustics entirely),
+  # click again to cancel. Mirrors the wake-word path exactly so every downstream handler
+  # (ducking, watchdog, modal, re-arm) behaves identically to a spoken wake.
+  - id: ptt_toggle
+    mode: single
+    then:
+      - if:
+          condition: {lambda: 'return id(va_active);'}
+          then:
+            - script.stop: va_watchdog
+            - script.execute: unduck_music
+            - voice_assistant.stop:
+            - lambda: 'id(va_active) = false;'
+            - script.execute: return_to_prev_page
+            - micro_wake_word.start:
+          else:
+            - script.execute: duck_music
+            - micro_wake_word.stop:
+            - voice_assistant.start:
+
+  # Hardware dismiss: clears whatever owns the screen. A physical escape hatch that works
+  # even when the render loop is too busy to service a touchscreen tap.
+  - id: hard_dismiss
+    mode: single
+    then:
+      - script.stop: doorbell_show
+      - script.stop: alert_show
+      - script.stop: weather_alert_show
+      - if:
+          condition: {lambda: 'return id(modal_open) != 0;'}
+          then: [{script.execute: modal_hide}]
+      - if:
+          condition: {lambda: 'return id(timer_done);'}
+          then:
+            - script.stop: timer_finished_show
+            - script.execute: timer_hide
+
+  # Voice-reply volume: 40% -> 70% -> 100% -> 40%, persisted, with an on-screen toast.
+  - id: cycle_voice_volume
+    mode: restart
+    then:
+      - lambda: |-
+          float v = id(spk_vol);
+          id(spk_vol) = (v < 0.55f) ? 0.7f : (v < 0.85f) ? 1.0f : 0.4f;
+      - speaker.volume_set:
+          id: i2s_speaker
+          volume: !lambda 'return id(spk_vol);'
+      - lvgl.label.update:
+          id: vol_toast
+          text: !lambda 'return str_sprintf("VOICE %.0f%%", id(spk_vol) * 100);'
+      - lvgl.widget.show: vol_toast
+      - delay: 1400ms
+      - lvgl.widget.hide: vol_toast
 
   # ── DUCKING ─────────────────────────────────────────────────────────────────────────────
   # The music plays on the Office Sonos ACROSS THE ROOM, so the puck's mic hears Rihanna and
@@ -1547,7 +1649,7 @@ script:
             if (!t.is_valid()) return std::string("");
             // Hand-rolled, NOT strftime("%-I:..."): %-I (unpadded hour) is a glibc extension
             // that ESP-IDF's newlib rejects, and ESPHome's strftime wrapper renders its failure
-            // as the literal string "ERROR" on the panel .
+            // as the literal string "ERROR" on the panel (shipped , the user saw it).
             int h = t.hour % 12; if (h == 0) h = 12;
             char buf[12];
             snprintf(buf, sizeof(buf), "%d:%02d %s", h, t.minute, t.hour < 12 ? "AM" : "PM");
@@ -1662,15 +1764,15 @@ script:
           condition:
             lambda: 'return id(current_page) == 1;'
           then:
-            - lvgl.page.show: {id: thermostat_page, animation: MOVE_RIGHT, time: 200ms}
+            - lvgl.page.show: {id: thermostat_page, animation: MOVE_RIGHT, time: 120ms}
           else:
             - if:
                 condition:
                   lambda: 'return id(current_page) == 2;'
                 then:
-                  - lvgl.page.show: {id: media_page, animation: MOVE_RIGHT, time: 200ms}
+                  - lvgl.page.show: {id: media_page, animation: MOVE_RIGHT, time: 120ms}
                 else:
-                  - lvgl.page.show: {id: main_page, animation: MOVE_RIGHT, time: 200ms}
+                  - lvgl.page.show: {id: main_page, animation: MOVE_RIGHT, time: 120ms}
 
   - id: adjust_thermostat
     parameters:
@@ -1769,6 +1871,21 @@ lvgl:
   # 25% buffer -> flushes in ~13ms quarters instead of one ~52ms full-frame push;
   # keeps the main loop responsive so the HA API connection stays up (else time/data starve).
   buffer_size: 25%
+  top_layer:
+    widgets:
+      # volume toast — top layer so it overlays whichever page/modal is showing
+      - label:
+          id: vol_toast
+          text: ""
+          text_font: roboto_label
+          align: CENTER
+          y: 120
+          text_color: 0xFFFFFF
+          bg_color: 0x0B0E13
+          bg_opa: 70%
+          pad_all: 8
+          radius: 8
+          hidden: true
   pages:
     - id: main_page
       on_load:
@@ -1785,10 +1902,11 @@ lvgl:
         - arc:
             id: ring_00
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 257
-            end_angle: 283
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 258
+            end_angle: 282
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1800,10 +1918,11 @@ lvgl:
         - arc:
             id: ring_01
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 287
-            end_angle: 313
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 288
+            end_angle: 312
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1815,10 +1934,11 @@ lvgl:
         - arc:
             id: ring_02
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 317
-            end_angle: 343
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 318
+            end_angle: 342
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1830,10 +1950,11 @@ lvgl:
         - arc:
             id: ring_03
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 347
-            end_angle: 13
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 348
+            end_angle: 12
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1845,10 +1966,11 @@ lvgl:
         - arc:
             id: ring_04
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 17
-            end_angle: 43
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 18
+            end_angle: 42
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1860,10 +1982,11 @@ lvgl:
         - arc:
             id: ring_05
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 47
-            end_angle: 73
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 48
+            end_angle: 72
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1875,10 +1998,11 @@ lvgl:
         - arc:
             id: ring_06
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 77
-            end_angle: 103
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 78
+            end_angle: 102
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1890,10 +2014,11 @@ lvgl:
         - arc:
             id: ring_07
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 107
-            end_angle: 133
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 108
+            end_angle: 132
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1905,10 +2030,11 @@ lvgl:
         - arc:
             id: ring_08
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 137
-            end_angle: 163
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 138
+            end_angle: 162
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1920,10 +2046,11 @@ lvgl:
         - arc:
             id: ring_09
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 167
-            end_angle: 193
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 168
+            end_angle: 192
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1935,10 +2062,11 @@ lvgl:
         - arc:
             id: ring_10
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 197
-            end_angle: 223
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 198
+            end_angle: 222
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1950,10 +2078,11 @@ lvgl:
         - arc:
             id: ring_11
             align: CENTER
-            width: 325
-            height: 325
-            start_angle: 227
-            end_angle: 253
+            width: 356
+            height: 356
+            arc_rounded: false
+            start_angle: 228
+            end_angle: 252
             arc_width: 13
             arc_color: 0x2A3038
             adjustable: false
@@ -1975,8 +2104,9 @@ lvgl:
         - arc:
             id: timer_cover
             align: CENTER
-            width: 325
-            height: 325
+            width: 356
+            height: 356
+            arc_rounded: false
             start_angle: 270
             end_angle: 269
             arc_width: 13
@@ -1989,16 +2119,6 @@ lvgl:
             knob:
               bg_opa: TRANSP
         # ── NOW tick: fixed marker just outside segment 0 ──
-        - obj:
-            id: now_tick
-            align: CENTER
-            x: 0
-            y: -170
-            width: 3
-            height: 9
-            radius: 1
-            bg_color: 0xFFFFFF
-            bg_opa: 90%
             border_width: 0
         # ── per-hour precip glyphs, in the annulus freed by centring the clock ──
         - label:
@@ -2007,30 +2127,30 @@ lvgl:
             text_font: mdi_precip
             align: CENTER
             x: 0
-            y: -136
+            y: -152
             text_color: 0x7FD4FF
         - label:
             id: px_01
             text: ""
             text_font: mdi_precip
             align: CENTER
-            x: 68
-            y: -118
+            x: 76
+            y: -132
             text_color: 0x7FD4FF
         - label:
             id: px_02
             text: ""
             text_font: mdi_precip
             align: CENTER
-            x: 118
-            y: -68
+            x: 132
+            y: -76
             text_color: 0x7FD4FF
         - label:
             id: px_03
             text: ""
             text_font: mdi_precip
             align: CENTER
-            x: 136
+            x: 152
             y: 0
             text_color: 0x7FD4FF
         - label:
@@ -2038,16 +2158,16 @@ lvgl:
             text: ""
             text_font: mdi_precip
             align: CENTER
-            x: 118
-            y: 68
+            x: 132
+            y: 76
             text_color: 0x7FD4FF
         - label:
             id: px_05
             text: ""
             text_font: mdi_precip
             align: CENTER
-            x: 68
-            y: 118
+            x: 76
+            y: 132
             text_color: 0x7FD4FF
         - label:
             id: px_06
@@ -2055,30 +2175,30 @@ lvgl:
             text_font: mdi_precip
             align: CENTER
             x: 0
-            y: 136
+            y: 152
             text_color: 0x7FD4FF
         - label:
             id: px_07
             text: ""
             text_font: mdi_precip
             align: CENTER
-            x: -68
-            y: 118
+            x: -76
+            y: 132
             text_color: 0x7FD4FF
         - label:
             id: px_08
             text: ""
             text_font: mdi_precip
             align: CENTER
-            x: -118
-            y: 68
+            x: -132
+            y: 76
             text_color: 0x7FD4FF
         - label:
             id: px_09
             text: ""
             text_font: mdi_precip
             align: CENTER
-            x: -136
+            x: -152
             y: 0
             text_color: 0x7FD4FF
         - label:
@@ -2086,16 +2206,16 @@ lvgl:
             text: ""
             text_font: mdi_precip
             align: CENTER
-            x: -118
-            y: -68
+            x: -132
+            y: -76
             text_color: 0x7FD4FF
         - label:
             id: px_11
             text: ""
             text_font: mdi_precip
             align: CENTER
-            x: -68
-            y: -118
+            x: -76
+            y: -132
             text_color: 0x7FD4FF
         # ── outdoor NOW: condition glyph + temperature, sitting under segment 0 ──
         - label:
@@ -2237,7 +2357,7 @@ lvgl:
             text: "UPSTAIRS"
             text_font: roboto_tiny
             align: TOP_MID
-            y: 40
+            y: 56
             text_color: 0xD5DEEC
         - label:
             id: therm_target_label
@@ -2258,8 +2378,8 @@ lvgl:
             text: "\U000F0374"
             text_font: mdi_btn
             align: CENTER
-            x: -104
-            y: 96
+            x: -88
+            y: 82
             text_color: 0x9AA6BB
         - label:
             id: fan_hint_icon
@@ -2267,14 +2387,14 @@ lvgl:
             text_font: mdi_btn
             align: CENTER
             x: 0
-            y: 96
+            y: 82
             text_color: 0x9AA6BB
         - label:
             text: "\U000F0415"
             text_font: mdi_btn
             align: CENTER
-            x: 104
-            y: 96
+            x: 88
+            y: 82
             text_color: 0x9AA6BB
     # ── MEDIA screen (3) — display only; the bottom tap-zones do vol−/play-pause/vol+ ──
     - id: media_page
@@ -2284,7 +2404,7 @@ lvgl:
         # album art fills the screen (falls back to the glow when idle) — set at runtime
         - image:
             id: media_bg
-            src: bg_glow
+            src: music_idle
             align: CENTER
         # full-screen shade: dims the album art so title/artist read clearly over any cover
         - obj:
@@ -2341,8 +2461,8 @@ lvgl:
             text: "\U000F075E"
             text_font: mdi_btn
             align: CENTER
-            x: -104
-            y: 96
+            x: -88
+            y: 82
             text_color: 0x9AA6BB
         - label:
             id: media_action_icon
@@ -2350,20 +2470,20 @@ lvgl:
             text_font: mdi_btn
             align: CENTER
             x: 0
-            y: 96
+            y: 82
             text_color: 0x9AA6BB
         - label:
             text: "\U000F075D"
             text_font: mdi_btn
             align: CENTER
-            x: 104
-            y: 96
+            x: 88
+            y: 82
             text_color: 0x9AA6BB
     # ── VOICE view (Okay Nabu): neural bg + phase tint + spinner + transcript/reply; tap anywhere = stop ──
     - id: doorbell_page
       skip: true          # modal — seized on a bell press, never in the tap cycle
       widgets:
-        # FULL-BLEED (v2, the user): the display is PHYSICALLY round, so filling the screen
+        # FULL-BLEED (v2, the user ): the display is PHYSICALLY round, so filling the screen
         # makes the glass itself the porthole — no radius/clip_corner software circle. v1 drew a
         # 240px inset circle and my lv_image_set_offset_x pan overran the image data, leaving a
         # straight-cut right edge. The container clips its child; the 640x360 frame sits at
