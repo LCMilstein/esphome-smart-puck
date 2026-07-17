@@ -1,0 +1,18 @@
+# TEMPLATE — import into HA and point the CAPITALIZED placeholders at your entities.
+# EXPORTED FROM HA — snapshot for review/history. HA is the source of truth; edit there.
+# NOTE: abbreviated snapshot — full description/templates live in HA.
+alias: Smart Puck — Air quality alert
+triggers:
+- trigger: numeric_state
+  entity_id: sensor.outdoor_aqi
+  above: 100
+  for:
+    minutes: 15
+actions:
+- action: esphome.smart_puck_show_weather_alert
+  data:
+    kind: haze
+    title: Air quality alert
+    message: Outdoor AQI {{ states('sensor.outdoor_aqi') }} — (EPA band text)
+mode: single
+max_exceeded: silent

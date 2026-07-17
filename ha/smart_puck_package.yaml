@@ -1,0 +1,134 @@
+# Smart Puck HA-side feeds. Drop into HA /config/packages/ (enable packages in configuration.yaml).
+template:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # FORECAST RING — next 12 hours, encoded for the puck's main-page bezel.
+  #
+  # State format: 12 comma-separated "temp:precip" pairs, hour 0 = NOW.
+  #   e.g. "91:0,92:0,92:0,91:0,90:0,87:0,83:0,81:0,79:0,77:0,76:0,75:0"
+  #   temp   = °F, rounded int
+  #   precip = 0 none | 1 light | 2 steady | 3 hard | 4 thunderstorm | 5 snow
+  # ~71 chars, well under the 255-char state limit. The device parses this directly.
+  #
+  # THE PROBABILITY GATE IS LOad-BEARING. Pirateweather reports `precipitation` in
+  # inches/hr and emits small non-zero values almost constantly — 19:00 was a
+  # clear sunny evening reporting 0.03"/hr at 9% probability. Encoding on amount alone
+  # would paint drops on a cloudless night and the ring would cry wolf permanently.
+  # So: no precip glyph at all below PROB_MIN, regardless of amount.
+  #
+  # Rain-rate thresholds are the conventional ones (inches/hr):
+  #   light  < 0.1   |   steady 0.1–0.3   |   hard >= 0.3
+  # ─────────────────────────────────────────────────────────────────────────────
+  - triggers:
+      - trigger: time_pattern
+        minutes: "/10"
+      - trigger: homeassistant
+        event: start
+      # On-demand refresh. Trigger-based template sensors sit at `unknown` until a trigger
+      # fires — so after a template.reload the ring stays dark for up to 10 minutes with no
+      # way to hurry it. Fire with:  ha_call_event / Developer Tools → Events →
+      # `smart_puck_refresh`. Also the hook for forcing a refresh after tuning thresholds.
+      - trigger: event
+        event_type: smart_puck_refresh
+      # TEST HOOK. The precip encoding can't be exercised by real weather on demand — it's 0%
+      # rain for the next 12h and drops/bolts/flakes have never rendered on the panel. Fire
+      # `smart_puck_test_ring` with a `ring` payload to push an arbitrary string straight
+      # through, bypassing the forecast. Fire `smart_puck_refresh` to restore real data.
+      #   ha_call_event("smart_puck_test_ring", {"ring": "68:0,67:1,66:2,64:3,63:4,..."})
+      - trigger: event
+        event_type: smart_puck_test_ring
+    actions:
+      - action: weather.get_forecasts
+        target:
+          entity_id: weather.YOUR_WEATHER_ENTITY
+        data:
+          type: hourly
+        response_variable: fc
+      # These MUST live inside `actions:`, not at top level. HA renders a trigger-template's
+      # top-level `variables:` BEFORE the action script runs, so a `response_variable` is not
+      # yet defined there — you get `'fc' is undefined`. (This is the identical bug throwing
+      # `'agenda' is undefined` in the legacy sensor above; fixed there too.)
+      - variables:
+          prob_min: 25
+          hours: "{{ fc.get('weather.YOUR_WEATHER_ENTITY', {}).get('forecast', [])[:12] }}"
+          # trigger.platform is 'event' only for the two event triggers; guard so time_pattern
+          # and homeassistant-start runs never touch trigger.event (which doesn't exist there).
+          override: >-
+            {{ trigger.event.data.get('ring', '')
+               if (trigger.platform | default('') == 'event'
+                   and trigger.event.event_type | default('') == 'smart_puck_test_ring')
+               else '' }}
+          ring_str: >-
+            {%- set ns = namespace(out=[]) -%}
+            {%- for h in hours -%}
+              {%- set t = h.temperature | float(0) | round(0) | int -%}
+              {%- set c = h.condition | default('') | string -%}
+              {%- set amt = h.precipitation | float(0) -%}
+              {%- set pp = h.precipitation_probability | float(0) -%}
+              {%- set p = 0 if (pp < prob_min or amt <= 0)
+                          else (4 if 'lightning' in c
+                          else (5 if 'snow' in c
+                          else (3 if amt >= 0.3
+                          else (2 if amt >= 0.1
+                          else 1)))) -%}
+              {%- set ns.out = ns.out + [ t ~ ':' ~ p ] -%}
+            {%- endfor -%}
+            {{ override if override else (ns.out | join(',')) }}
+    sensor:
+      - name: "Smart Puck Forecast Ring"
+        unique_id: smart_puck_forecast_ring
+        icon: mdi:chart-donut
+        state: "{{ ring_str }}"
+        attributes:
+          low: "{{ (hours | map(attribute='temperature') | map('float') | list | min | round(0) | int) if hours else 0 }}"
+          high: "{{ (hours | map(attribute='temperature') | map('float') | list | max | round(0) | int) if hours else 0 }}"
+          hours_returned: "{{ hours | count }}"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # TRACK PROGRESS — % position in the current song, for the media page's outer ring.
+  # HA computes it (media_position only updates on play/pause/seek, so we extrapolate
+  # from media_position_updated_at); the device just renders the number. /15s is the
+  # deliberate cadence: 4 updates/min at 5px ring width is visually smooth, and finer
+  # would just spam the ESPHome API channel.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - triggers:
+      - trigger: time_pattern
+        seconds: "/15"
+      - trigger: state
+        entity_id: media_player.living_room
+    sensor:
+      - name: "Smart Puck Track Progress"
+        unique_id: smart_puck_track_progress
+        icon: mdi:progress-clock
+        unit_of_measurement: "%"
+        state: >-
+          {% set mp = 'media_player.living_room' %}
+          {% set dur = state_attr(mp, 'media_duration') | float(0) %}
+          {% if states(mp) == 'playing' and dur > 0 %}
+            {% set upd = state_attr(mp, 'media_position_updated_at') %}
+            {% set pos = state_attr(mp, 'media_position') | float(0)
+                         + ((now() - upd).total_seconds() if upd else 0) %}
+            {{ ([0, (100 * pos / dur) | round(1), 100] | sort)[1] }}
+          {% else %}
+            0
+          {% endif %}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTDOOR AQI — Pirate Weather v2 (`?version=2` is load-bearing: airQualityIndex and
+# smoke exist ONLY in the v2 response, and the HA pirateweather integration exposes
+# neither). Feeds the puck's haze badge (persistent state) + AQI alert modal
+# (crossing event). URL lives in secrets.yaml (carries the API key).
+# 30min cadence: AQI moves on wildfire-plume timescales, and the free tier is
+# 10k calls/month — this adds ~48/day on top of the integration's ~72.
+# ─────────────────────────────────────────────────────────────────────────────
+rest:
+  - resource: !secret pirateweather_aqi_url
+    scan_interval: 1800
+    sensor:
+      - name: "Outdoor AQI"
+        unique_id: outdoor_aqi_pirateweather
+        icon: mdi:lungs
+        state_class: measurement
+        value_template: "{{ value_json.currently.airQualityIndex | int(0) }}"
+        json_attributes_path: "$.currently"
+        json_attributes:
+          - smoke

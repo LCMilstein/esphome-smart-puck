@@ -1,0 +1,52 @@
+# Gotchas
+
+Everything below was paid for with a real on-device failure during this build.
+
+
+## Architecture rule
+
+**The device renders; Home Assistant decides.** Expose `api: actions:` (e.g. `show_camera`,
+`show_alert`) and put ALL policy — what triggers them, thresholds, cooldowns — in HA
+automations. Changing policy must never require an OTA.
+
+## Rotation + touch (agents reliably get this wrong)
+
+- Rotation goes in the **`lvgl:` block**: `rotation: 180`. NOT on the display (rejected/ignored
+  in LVGL mode) and NOT via `touchscreen: transform:` mirrors.
+- **Never mirror the touchscreen to "fix" touch** — LVGL already rotates touch for its own
+  widgets; a touchscreen transform double-flips every interactive widget.
+- **`on_touch:` lambdas run OUTSIDE LVGL** and still see raw chip coordinates. Compensate
+  locally: for 180°, `visual = (dim-1) - raw` on both axes.
+
+## Render-fault diagnosis (tofu glyphs, solid ring, garbled UI)
+
+1. **`Reset Reason` + uptime FIRST.** Splits crash-reboot from live render fault instantly —
+   don't hunt a crash that never happened.
+2. The `debug`/`sensor` diagnostics (**Loop Time, Heap Free, Heap Min Free, Fragmentation,
+   Free PSRAM**) land in HA's recorder → past incidents are diagnosable retroactively.
+3. Discriminate by what's on the panel: **tofu boxes were DRAWN** (LVGL rendered fallback ⇒
+   draw-time failure, e.g. glyph/mask alloc) vs **frame FROZEN** (loop starved ⇒
+   `lv_timer_handler` never ran). Both recover without reboot. Loop Time spiking (43→1770ms)
+   = starvation evidence; flat heap does NOT exonerate memory — 30s samples miss transient
+   allocs, and check largest-free-block, not just free.
+4. `logger: level: ERROR` (common on these builds) **suppresses the LVGL warnings that name
+   the failing component** — raise it while hunting, and keep a reconnecting log capture
+   (`esphome logs` in a loop) because ESPHome retains nothing.
+
+## Quick-reference traps
+
+| Trap | Rule |
+|---|---|
+| Partition table | OTA writes only the app slot. Table changes need a WIRED flash of `firmware.factory.bin`. Docker Desktop on macOS cannot pass USB — build on Linux, esptool from the Mac. |
+| MDI glyphs | Verify by **rendering and looking**: meta.json codepoints drift vs pinned webfont (one "package" codepoint renders as an OWL), and ink-tests prove presence, not identity. Local TTF cache: `.esphome/font/<hash>/font.ttf`. |
+| First `api: actions:` | Link error `undefined reference get_execute_arg_value<StringRef>` = stale CMake glob (user_services.cpp newly required, never compiled). `esphome clean`, don't blame upstream. |
+| strftime | `%-I` (glibc extension) fails on esp-idf newlib and ESPHome renders the literal string **"ERROR"** on the panel. Hand-roll with snprintf. |
+| `online_image` | Retains the previous download — on fetch error, show a placeholder, never the buffer (a doorbell would show the LAST visitor's face). Resize SERVER-side (frame decode blocks the main loop ~0.5s/23KB). Frigate honours only `?height=`; `h`/`w`/`size` are silently ignored. |
+| LVGL arcs | Free-position segments via `lv_arc_set_bg_angles` (background arc); colour lives on `LV_PART_MAIN`. A 3-4° background arc drawn wider than a track = a tick at any angle. Full-circle value arc: `start_angle: 270, end_angle: 269`. |
+| Runtime re-align | Widgets placed with `align:` must move via `lv_obj_align(obj, LV_ALIGN_..., x, y)`, not `lv_obj_set_x`. |
+| Edge-trigger alerts | Latch the condition (alert on transition only) + **boot-guard** (`millis() < 120000` seeds the latch silently) — rebooting mid-storm is not news. Remember the guard when testing: inject after 2.5 min. |
+| HA trigger-templates | Top-level `variables:` render BEFORE `actions:` → any `response_variable` is undefined there. Move `variables:` inside `actions:`. |
+| HA `variables:` typing | Values round-trip text→literal_eval. Dicts holding enum objects (e.g. Music Assistant results) silently degrade to STRINGS → `.uri` renders empty. Only scalars survive; read `res.tracks[0].uri` inline at the call site. |
+| Pirate Weather AQI | `airQualityIndex`/`smoke` exist only with **`?version=2`**; the HA integration exposes neither. `fireIndex` is fire danger, not smoke. |
+| ESPHome CLI in Docker | Compile/logs containers probe the dashboard healthcheck → always "unhealthy"; it's a false positive. Builds leave root-owned files in `.esphome/`. |
+| Blocking `docker run` in a service | bash can't act on SIGTERM while blocked → systemd SIGKILLs and **orphans the container** (a 2nd log attach corrupts the capture). Fixed `--name` + `ExecStop=docker rm -f <name>`. |

@@ -1,0 +1,47 @@
+# TEMPLATE — import into HA and point the CAPITALIZED placeholders at your entities.
+# EXPORTED FROM HA — snapshot for review/history. HA is the source of truth; edit there.
+id: '1784295613536'
+alias: Smart Puck — Alert modal
+description: 'Mirrors any notification sent to the user''s phone onto the puck as an interrupting modal (auto-closes
+  after 60s).
+
+
+  WHY call_service RATHER THAN A NEW EVENT: the user''s ask was ''anything already worth pinging my phone shows
+  on the puck''. HA has no hook on notify.*, but it DOES fire a `call_service` event for every service
+  call -- so this rides the EXISTING notify path with zero changes to the automations that send them.
+  Nothing to remember to wire up later; new notifications get this for free.
+
+
+  FILTERS, each load-bearing:
+
+  - ''YOUR_NAME'' in service: your devices only. Other family members'' phone notifications have no business
+  seizing the office screen.
+
+  - message not starting ''command_''/''clear_notification'': the mobile_app notify service doubles as
+  a REMOTE-CONTROL channel (command_dnd, command_broadcast_intent...). Those are not messages and would
+  render as gibberish.
+
+  - message length > 0: TTS/command payloads often carry an empty message.
+
+
+  Truncated to 110 chars: the puck''s label wraps but the round screen has ~5 usable lines; a wall of
+  text is worse than a clipped one. The phone still has the full text.'
+triggers:
+- trigger: event
+  event_type: call_service
+  event_data:
+    domain: notify
+conditions:
+- condition: template
+  value_template: '{{ ''YOUR_NAME'' in (trigger.event.data.service | default('''') | lower) }}'
+- condition: template
+  value_template: '{% set m = trigger.event.data.service_data.message | default('''') | string %}{{ m
+    | length > 0 and not m.startswith(''command_'') and m != ''clear_notification'' }}'
+actions:
+- action: esphome.smart_puck_show_alert
+  data:
+    title: '{{ trigger.event.data.service_data.title | default(''Alert'') | string | truncate(40, True,
+      '''') }}'
+    message: '{{ trigger.event.data.service_data.message | string | truncate(110, True, ''…'') }}'
+mode: queued
+max: 5

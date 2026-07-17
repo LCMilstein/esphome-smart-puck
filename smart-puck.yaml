@@ -1,0 +1,2565 @@
+# Smart Puck v2 - Waveshare ESP32-S3-Touch-LCD-1.85C (V1 board)
+# M1: substrate - display + touch + RTC + backlight + diagnostics + one LVGL page
+# DEVICE NAME IS FROZEN (HA adoption depends on it). Do not rename.
+substitutions:
+  # ── EDIT THESE for your install ─────────────────────────────────────────────
+  devicename: smart-puck
+  friendly: "Smart Puck"
+  ha_base_url: "http://homeassistant.local:8123"      # your HA URL (album art fetch)
+  frigate_base_url: "http://homeassistant.local:5000" # your Frigate URL (camera portholes)
+  media_player_native: media_player.living_room       # the Sonos/speaker this puck controls
+  media_player_ma: media_player.living_room_ma        # its Music Assistant mirror (voice music)
+  climate_entity: climate.thermostat                  # thermostat page
+  occupancy_sensor: binary_sensor.living_room_occupancy  # dims the screen when room is empty
+  weather_entity: weather.pirateweather               # main-page condition + outdoor temp
+
+esphome:
+  name: $devicename
+  friendly_name: $friendly
+  on_boot:
+    # Wake the CST816 BEFORE the touch component sets up. The touch chip's IRQ_EN_MOTION register
+    # (what makes INT fire) is written over I2C during touch setup at priority DATA(600); if TP_RST
+    # is still asserted then, the chip doesn't ACK and that write silently fails → no touch. So at
+    # priority 700 (>600, after pca9554@900 + tp_reset switch@800) we pulse TP_RST high. BLOCKING
+    # delay() on purpose — the `- delay:` ACTION yields and would let touch set up mid-pulse.
+    - priority: 700
+      then:
+        - lambda: |-
+            ESP_LOGI("tp_reset", "pulsing TP_RST (EXIO%d) to wake CST816", 0);
+            id(tp_reset).turn_off();  // TP_RST LOW  = assert reset
+            delay(10);
+            id(tp_reset).turn_on();   // TP_RST HIGH = release reset
+            delay(50);                // CST816 boot-settle before touch setup writes IRQ_EN_MOTION
+            ESP_LOGI("tp_reset", "TP_RST released");
+    # After touch setup (600) — while the chip is still awake (~1s in, before its ~2s auto-sleep) —
+    # disable auto-sleep so it stays responsive. Register 0xFE = DisAutoSleep on the CST816; without
+    # this the chip naps after 2s idle and the first tap only wakes it (unreported) → sluggish/dead touch.
+    - priority: 100
+      then:
+        - lambda: |-
+            bool ok = id(my_touchscreen).write_byte(0xFE, 0x01);
+            ESP_LOGI("cst816", "DisAutoSleep(0xFE) write %s", ok ? "OK" : "FAILED");
+    - priority: 600
+      then:
+        - pcf85063.read_time
+    - priority: -100
+      then:
+        - light.turn_on:
+            id: backlight
+            brightness: 80%
+        - lvgl.page.show: main_page   # always boot to the clock face (page 0), keeps cycle order predictable
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: ESP32S3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+  # No `partitions:` override — the 6MB `model` partition was an esp_sr leftover from the vendor
+  # firmware and nothing referenced it (subtype: undefined). micro_wake_word compiles its model
+  # into the app binary. Dropping it lets ESPHome size the two OTA slots to fill the 16MB flash.
+  # Changing this table requires a WIRED flash — OTA only writes the app slot, not the table at 0x8000.
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  baud_rate: 0        # all-OTA now: no physical UART, logs stream via the HA API connection
+  level: INFO
+
+debug:
+  update_interval: 30s
+
+api:
+  reboot_timeout: 4h
+  encryption:
+    key: !secret api_key
+  # Sync backlight to current office occupancy on (re)connect — covers the "rebooted while the room
+  # was empty" case, since a binary_sensor's INITIAL imported state doesn't re-fire on_state.
+  on_client_connected:
+    - delay: 4s
+    - if:
+        condition: {lambda: 'return id(office_occupancy).state;'}
+        then: [{light.turn_on: {id: backlight, brightness: 80%, transition_length: 800ms}}]
+        else: [{light.turn_on: {id: backlight, brightness: 12%, transition_length: 1500ms}}]
+    - micro_wake_word.start   # arm "Okay Nabu" once HA (Assist pipeline) is reachable
+  # HA-callable actions. The puck is the passive side: HA decides WHAT is worth interrupting for
+  # (doorbell press, an actionable notification) and calls in. Keeps policy in HA where the user can
+  # see and edit it, rather than compiled into firmware behind an OTA.
+  actions:
+    - action: show_doorbell
+      then:
+        - lambda: 'id(camera_title) = "Front door";'
+        - online_image.set_url:
+            id: doorbell_snap
+            url: "${frigate_base_url}/api/doorbell/latest.jpg?height=360"
+        - component.update: doorbell_snap   # download -> on_download_finished shows the modal
+    # ANY Frigate camera, one firmware action. HA owns the policy of what deserves a porthole
+    # (vehicle in driveway, person at the fence, ...) — new triggers are HA automations, not OTAs.
+    - action: show_camera
+      variables:
+        camera: string
+        title: string
+      then:
+        - lambda: 'id(camera_title) = title;'
+        - online_image.set_url:
+            id: doorbell_snap
+            url: !lambda 'return "${frigate_base_url}/api/" + camera + "/latest.jpg?height=360";'
+        - component.update: doorbell_snap
+    - action: show_alert
+      variables:
+        title: string
+        message: string
+      then:
+        - script.execute:
+            id: alert_show
+            title: !lambda 'return title;'
+            message: !lambda 'return message;'
+    - action: show_weather_alert
+      variables:
+        kind: string
+        title: string
+        message: string
+      then:
+        - script.execute:
+            id: weather_alert_show
+            kind: !lambda 'return kind;'
+            title: !lambda 'return title;'
+            message: !lambda 'return message;'
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  reboot_timeout: 4h
+
+i2c:
+  id: main_i2c
+  sda: GPIO11
+  scl: GPIO10
+  scan: false         # NOTE: CST816 touch @0x15 is ALIVE (worked from factory) but ESPHome can't wake it —
+                      #   tried reset EXIO1 pulse / no-reset / EXIO1 hold-high, all "Failed to read chip ID".
+                      #   Needs the vendor's exact wake sequence or correct TP_RST pin. Touch parked; display works.
+  frequency: 400kHz
+
+pca9554:
+  - id: tca9554_dev
+    i2c_id: main_i2c
+    address: 0x20
+
+time:
+  - platform: pcf85063
+    id: rtc_time
+    i2c_id: main_i2c
+    update_interval: never
+  - platform: homeassistant
+    id: homeassistant_time
+    on_time_sync:
+      then:
+        - pcf85063.write_time
+
+output:
+  - platform: ledc
+    pin: GPIO5
+    id: backlight_output
+
+light:
+  - platform: monochromatic
+    name: "Backlight"
+    id: backlight
+    icon: "mdi:television"
+    entity_category: config
+    output: backlight_output
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 250ms
+
+sensor:
+  # Touch counter — increments in on_touch, published to HA so I can confirm the CST816 is reporting
+  # touches WITHOUT relying on the (stalling) USB serial stream. Watch the Touch Count sensor.
+  - platform: template
+    name: "Touch Count"
+    id: touch_count_sensor
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: adc
+    pin: GPIO8
+    name: "Battery Voltage"
+    attenuation: 12db
+    update_interval: 60s
+    filters:
+      - multiply: 2.0
+  - platform: internal_temperature
+    name: "Chip Temp"
+    update_interval: 60s
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+    update_interval: 60s
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    entity_category: diagnostic
+    update_interval: 60s
+  - platform: debug
+    free:
+      name: "Heap Free"
+      entity_category: diagnostic
+    min_free:
+      name: "Heap Min Free"
+      entity_category: diagnostic
+    fragmentation:
+      name: "Heap Fragmentation"
+      entity_category: diagnostic
+    loop_time:
+      name: "Loop Time"
+      entity_category: diagnostic
+    psram:
+      name: "Free PSRAM"
+      entity_category: diagnostic
+  # ── M2: live data from Home Assistant ──
+  # Office Sonos volume — read so ducking can restore the EXACT level, not a hardcoded guess.
+  - platform: homeassistant
+    id: sonos_volume
+    entity_id: "${media_player_ma}"
+    attribute: volume_level
+  # NOTE: indoor temperature is no longer on the main page — it moved one tap away to the
+  # thermostat screen, which frees the centre for the clock and the annulus for the ring.
+  # (The thermostat page has its own `therm_current` feed; nothing here needs climate data.)
+  - platform: homeassistant
+    id: outdoor_temp
+    entity_id: "${weather_entity}"
+    attribute: temperature
+    on_value:
+      - lvgl.label.update:
+          id: temp_out_text
+          text: !lambda 'return str_sprintf("%.0f°", x);'
+  # ── media: track position % -> the media page's outer progress ring ──
+  - platform: homeassistant
+    id: track_progress
+    entity_id: sensor.smart_puck_track_progress
+    on_value:
+      - lvgl.arc.update:
+          id: media_ring
+          value: !lambda 'return (int) x;'
+  # ── outdoor AQI -> haze badge visibility + EPA band colour ──
+  - platform: homeassistant
+    id: outdoor_aqi
+    entity_id: sensor.outdoor_aqi
+    on_value:
+      - lambda: |-
+          if (x > 100.0f) {
+            uint32_t c = (x > 200.0f) ? 0xB06CE8 : (x > 150.0f) ? 0xFF5A3C : 0xFF9F43;
+            lv_obj_set_style_text_color(id(aqi_note), lv_color_hex(c), LV_PART_MAIN);
+            lv_obj_clear_flag(id(aqi_note), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(aqi_note), LV_OBJ_FLAG_HIDDEN);
+          }
+      - script.execute: layout_badges
+  # ── thermostat: current temp -> "currently NN°" on the thermostat page ──
+  - platform: homeassistant
+    id: therm_current
+    entity_id: "${climate_entity}"
+    attribute: current_temperature
+    on_value:
+      - lvgl.label.update:
+          id: therm_current_label
+          text: !lambda 'return str_sprintf("CURRENTLY %.0f°", x);'
+      - script.execute: update_therm_ring
+  # ── thermostat: target temp -> big target label + seed the on-device working target ──
+  - platform: homeassistant
+    id: therm_target
+    entity_id: "${climate_entity}"
+    attribute: temperature
+    on_value:
+      - lambda: 'id(ui_target) = NAN;'
+      - lvgl.label.update:
+          id: therm_target_label
+          text: !lambda 'return str_sprintf("%.0f°", x);'
+      - script.execute: update_therm_ring
+
+text_sensor:
+  # Touch debug — published once per gesture (on_release) as "s(startX,startY) e(endX,endY) dx dy".
+  # Lets me read actual touch coords + swipe delta over HA to see why nav doesn't fire, w/o serial.
+  - platform: template
+    name: "Touch Debug"
+    id: touch_debug
+    update_interval: never
+  # ── thermostat fan mode -> fan_on global (for toggle) + fan icon show/hide ──
+  - platform: homeassistant
+    id: therm_fan_mode
+    entity_id: "${climate_entity}"
+    attribute: fan_mode
+    on_value:
+      - lambda: 'id(fan_on) = (x == std::string("on"));'
+      # recolor the bottom fan control icon: blue when running, muted grey when off (no 2nd icon)
+      - if:
+          condition: {lambda: 'return id(fan_on);'}
+          then: [{lvgl.label.update: {id: fan_hint_icon, text_color: 0x4FA8FF}}]
+          else: [{lvgl.label.update: {id: fan_hint_icon, text_color: 0x9AA6BB}}]
+  # ── HVAC mode (climate state) -> thermostat-screen background ──
+  - platform: homeassistant
+    id: climate_mode
+    entity_id: "${climate_entity}"
+    on_value:
+      - if: {condition: {lambda: 'return x == "heat";'},      then: [{lvgl.image.update: {id: thermo_bg, src: tm_heat}}]}
+      - if: {condition: {lambda: 'return x == "cool";'},      then: [{lvgl.image.update: {id: thermo_bg, src: tm_cool}}]}
+      - if: {condition: {lambda: 'return x == "heat_cool";'}, then: [{lvgl.image.update: {id: thermo_bg, src: tm_heatcool}}]}
+      - if: {condition: {lambda: 'return x == "off";'},       then: [{lvgl.image.update: {id: thermo_bg, src: tm_off}}]}
+      - lambda: |-
+          uint32_t c = 0x9AA6BB;                       // unknown/idle grey
+          if (x == "heat") c = 0xFF9F43;
+          else if (x == "cool") c = 0x6EC6FF;
+          else if (x == "heat_cool") c = 0x5FD9C0;
+          else if (x == "off") c = 0x555C66;
+          lv_obj_set_style_arc_color(id(therm_ring), lv_color_hex(c), LV_PART_INDICATOR);
+      - script.execute: update_therm_ring
+  # ── media player: playing state -> media mid-icon + main-screen now-playing visibility ──
+  - platform: homeassistant
+    id: media_state
+    entity_id: "${media_player_native}"
+    on_value:
+      - lvgl.label.update:
+          id: media_action_icon
+          text: !lambda 'return x == std::string("playing") ? std::string("\U000F03E4") : std::string("\U000F040A");'
+      - if:   # main clock screen: a bare note = "something is playing". No title (unreadable at 13px).
+          condition: {lambda: 'return x == std::string("playing");'}
+          then: [{lvgl.widget.show: np_note}]
+          else: [{lvgl.widget.hide: np_note}]
+      - script.execute: layout_badges
+      - if:   # media screen bg: keep album art while playing/paused, else revert to the glow
+          condition: {lambda: 'return x != std::string("playing") && x != std::string("paused");'}
+          then: [{lvgl.image.update: {id: media_bg, src: bg_glow}}]
+  - platform: homeassistant
+    id: media_title
+    entity_id: "${media_player_native}"
+    attribute: media_title
+    on_value:
+      - lvgl.label.update:
+          id: media_title_label
+          text: !lambda 'return x.empty() ? std::string("Office") : x;'
+  - platform: homeassistant
+    id: media_artist
+    entity_id: "${media_player_native}"
+    attribute: media_artist
+    on_value:
+      - lvgl.label.update:
+          id: media_artist_label
+          text: !lambda 'return x;'
+  # ── FORECAST RING ──────────────────────────────────────────────────────────────────────
+  # sensor.smart_puck_forecast_ring = 12 "temp:precip" pairs, hour 0 = NOW at 12 o'clock.
+  #   "91:0,92:0,66:1,64:2,63:3,62:4,55:5,..."
+  #   precip: 0 none | 1 light | 2 steady | 3 hard | 4 storm | 5 snow
+  # Colour scales across THIS window's own min/max, not an absolute scale — so the ring always
+  # uses its full dynamic range and a flat 5° day still reads as a gradient.
+  - platform: homeassistant
+    id: forecast_ring
+    entity_id: sensor.smart_puck_forecast_ring
+    on_value:
+      - lambda: |-
+          lv_obj_t *rings[12] = {id(ring_00), id(ring_01), id(ring_02), id(ring_03),
+                                 id(ring_04), id(ring_05), id(ring_06), id(ring_07),
+                                 id(ring_08), id(ring_09), id(ring_10), id(ring_11)};
+          lv_obj_t *pxs[12]   = {id(px_00), id(px_01), id(px_02), id(px_03),
+                                 id(px_04), id(px_05), id(px_06), id(px_07),
+                                 id(px_08), id(px_09), id(px_10), id(px_11)};
+          int temps[12], precs[12], n = 0;
+          size_t pos = 0;
+          while (n < 12 && pos <= x.size()) {
+            size_t comma = x.find(',', pos);
+            std::string tok = x.substr(pos, comma == std::string::npos ? std::string::npos
+                                                                       : comma - pos);
+            size_t colon = tok.find(':');
+            if (colon == std::string::npos) break;
+            temps[n] = atoi(tok.substr(0, colon).c_str());
+            precs[n] = atoi(tok.substr(colon + 1).c_str());
+            n++;
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+          }
+          if (n == 0) { ESP_LOGW("ring", "unparseable: %s", x.c_str()); return; }
+          // ── RAIN INCOMING: alert once when precip ENTERS the next ~2h ─────────────────
+          // Edge-triggered on the transition, latched by rain_warned, reset when dry — the
+          // feed refreshes every 10min and MUST NOT re-alert while it keeps raining. The
+          // boot guard seeds the latch silently: rebooting mid-storm is not news.
+          {
+            bool soon = (precs[0] > 0) || (n > 1 && precs[1] > 0);
+            if (millis() < 120000) {
+              id(rain_warned) = soon;
+            } else if (soon && !id(rain_warned)) {
+              id(rain_warned) = true;
+              int pk = (precs[0] > 0) ? precs[0] : precs[1];
+              const char *kind  = (pk == 4) ? "storm" : (pk == 5) ? "snow"
+                                : (pk == 3) ? "pouring" : "rain";
+              const char *what  = (pk == 4) ? "Storm incoming"
+                                : (pk == 5) ? "Snow incoming" : "Rain incoming";
+              id(weather_alert_show).execute(kind, what, "Within the next 2 hours");
+            } else if (!soon) {
+              id(rain_warned) = false;
+            }
+          }
+          // ── ABSOLUTE °F → colour ────────────────────────────────────────────────────────
+          // NOT relative to the window's own min/max. Relative was the first build and it LIES:
+          // a January window of 35→19 painted 35° hot orange because it was the warmest hour,
+          // i.e. the ring told you it was warm while you scraped the windshield. Colour has to
+          // mean the same thing in July and January or it means nothing.
+          // 32 gets its own stop on purpose — freezing is the temperature that changes what you
+          // DO, so it should be a colour you can name. Cost: July rings are a narrow orange→
+          // yellow band instead of a dramatic sweep. That's honest; July nights aren't cold.
+          static const int TSTOP[8] = {0, 20, 32, 45, 58, 70, 82, 95};
+          static const uint8_t CSTOP[8][3] = {
+            {0x7A, 0x4F, 0xD4},   //  0  violet  brutal
+            {0x3B, 0x7D, 0xD8},   // 20  deep blue
+            {0x6E, 0xC6, 0xFF},   // 32  cyan    FREEZING
+            {0x5F, 0xD9, 0xC0},   // 45  teal
+            {0x8F, 0xD9, 0x6B},   // 58  green
+            {0xF2, 0xD5, 0x44},   // 70  yellow
+            {0xFF, 0x9F, 0x43},   // 82  orange
+            {0xFF, 0x5A, 0x3C}};  // 95  red
+          int lo = temps[0], hi = temps[0];
+          for (int i = 0; i < n; i++) { if (temps[i] < lo) lo = temps[i];
+                                        if (temps[i] > hi) hi = temps[i]; }
+          for (int i = 0; i < 12; i++) {
+            if (i >= n) {                       // short forecast: hide the unused tail
+              lv_obj_add_flag(rings[i], LV_OBJ_FLAG_HIDDEN);
+              lv_label_set_text(pxs[i], "");
+              continue;
+            }
+            lv_obj_clear_flag(rings[i], LV_OBJ_FLAG_HIDDEN);
+            int tv = temps[i];   // NOT `t` — the precip block below already uses `const char *t`
+            uint8_t r, g, b;
+            if (tv <= TSTOP[0]) { r = CSTOP[0][0]; g = CSTOP[0][1]; b = CSTOP[0][2]; }
+            else if (tv >= TSTOP[7]) { r = CSTOP[7][0]; g = CSTOP[7][1]; b = CSTOP[7][2]; }
+            else {
+              int k = 0;
+              while (k < 6 && tv > TSTOP[k + 1]) k++;
+              float f = (float)(tv - TSTOP[k]) / (float)(TSTOP[k + 1] - TSTOP[k]);
+              r = (uint8_t)(CSTOP[k][0] + ((int)CSTOP[k+1][0] - (int)CSTOP[k][0]) * f);
+              g = (uint8_t)(CSTOP[k][1] + ((int)CSTOP[k+1][1] - (int)CSTOP[k][1]) * f);
+              b = (uint8_t)(CSTOP[k][2] + ((int)CSTOP[k+1][2] - (int)CSTOP[k][2]) * f);
+            }
+            lv_obj_set_style_arc_color(rings[i], lv_color_make(r, g, b), LV_PART_MAIN);
+            const char *t = "";
+            uint32_t col = 0x7FD4FF;
+            switch (precs[i]) {
+              case 1: t = "\U000F058C"; break;
+              case 2: t = "\U000F058C\U000F058C"; break;
+              case 3: t = "\U000F058C\U000F058C\U000F058C"; break;
+              case 4: t = "\U000F140B"; col = 0xFFE066; break;
+              case 5: t = "\U000F0717"; col = 0xDCF3FF; break;
+              default: t = ""; break;
+            }
+            if (i == 0) t = "";   // hour 0 is already the big condition glyph — don't say it twice
+            lv_label_set_text(pxs[i], t);
+            lv_obj_set_style_text_color(pxs[i], lv_color_hex(col), LV_PART_MAIN);
+          }
+          ESP_LOGI("ring", "12h %d..%dF, %d slots", lo, hi, n);
+  - platform: homeassistant
+    id: forecast_low
+    entity_id: sensor.smart_puck_forecast_ring
+    attribute: low
+    on_value:
+      - lvgl.label.update:
+          id: low_label
+          text: !lambda 'return x.empty() ? std::string("") : ("LOW " + x + "°");'
+  # album-art URL (HA proxy path w/ signed token) -> fetch the cover into online_image
+  - platform: homeassistant
+    id: media_art_url
+    entity_id: "${media_player_native}"
+    attribute: entity_picture
+    on_value:
+      - if:
+          condition: {lambda: 'return !x.empty();'}
+          then:
+            - online_image.set_url:
+                id: album_art
+                url: !lambda 'return std::string("${ha_base_url}") + x;'
+            - component.update: album_art
+  - platform: version
+    name: "Firmware Version"
+    entity_category: diagnostic
+    hide_timestamp: true
+  - platform: wifi_info
+    ip_address:
+      name: "Device IP Address"
+      entity_category: diagnostic
+  - platform: debug
+    reset_reason:
+      name: "Reset Reason"
+      entity_category: diagnostic
+  # ── M2: weather condition -> icon + text ──
+  - platform: homeassistant
+    id: weather_condition
+    entity_id: "${weather_entity}"
+    on_value:
+      - lvgl.label.update:
+          id: weather_icon
+          text: !lambda |-
+            if (x == "sunny") return std::string("\U000F0599");
+            if (x == "clear-night") return std::string("\U000F0594");
+            if (x == "partlycloudy") return std::string("\U000F0595");
+            if (x == "cloudy") return std::string("\U000F0590");
+            if (x == "rainy") return std::string("\U000F0597");
+            if (x == "pouring") return std::string("\U000F0596");
+            if (x == "snowy") return std::string("\U000F0598");
+            if (x == "fog") return std::string("\U000F0591");
+            if (x == "lightning" || x == "lightning-rainy") return std::string("\U000F0593");
+            if (x == "windy" || x == "windy-variant") return std::string("\U000F059D");
+            if (x == "hail") return std::string("\U000F0592");
+            return std::string("\U000F0590");
+      # swap the clock-screen background to match the condition (src must be a compile-time image id)
+      - if:
+          condition: {lambda: 'return x == "sunny";'}
+          then: [{lvgl.image.update: {id: bg_main, src: wx_sunny}}]
+      - if:
+          condition: {lambda: 'return x == "clear-night";'}
+          then: [{lvgl.image.update: {id: bg_main, src: wx_clear_night}}]
+      - if:
+          condition: {lambda: 'return x == "partlycloudy";'}
+          then: [{lvgl.image.update: {id: bg_main, src: wx_partlycloudy}}]
+      - if:
+          condition: {lambda: 'return x == "cloudy" || x == "exceptional";'}
+          then: [{lvgl.image.update: {id: bg_main, src: wx_cloudy}}]
+      - if:
+          condition: {lambda: 'return x == "rainy";'}
+          then: [{lvgl.image.update: {id: bg_main, src: wx_rainy}}]
+      - if:
+          condition: {lambda: 'return x == "pouring";'}
+          then: [{lvgl.image.update: {id: bg_main, src: wx_pouring}}]
+      - if:
+          condition: {lambda: 'return x == "snowy" || x == "snowy-rainy";'}
+          then: [{lvgl.image.update: {id: bg_main, src: wx_snowy}}]
+      - if:
+          condition: {lambda: 'return x == "fog";'}
+          then: [{lvgl.image.update: {id: bg_main, src: wx_fog}}]
+      - if:
+          condition: {lambda: 'return x == "lightning" || x == "lightning-rainy";'}
+          then: [{lvgl.image.update: {id: bg_main, src: wx_lightning}}]
+      - if:
+          condition: {lambda: 'return x == "windy" || x == "windy-variant";'}
+          then: [{lvgl.image.update: {id: bg_main, src: wx_windy}}]
+      - if:
+          condition: {lambda: 'return x == "hail";'}
+          then: [{lvgl.image.update: {id: bg_main, src: wx_hail}}]
+
+binary_sensor:
+  - platform: status
+    name: "Status"
+    entity_category: diagnostic
+  # Is the puck actually LISTENING? Published every 30s by the self-heal interval. Without this,
+  # "went deaf" is invisible — the screen looks perfectly healthy either way. Alert on this being
+  # off for >2min in HA if this ever becomes a device the user depends on.
+  - platform: template
+    id: mww_armed
+    name: "Wake Word Armed"
+    entity_category: diagnostic
+    icon: mdi:ear-hearing
+  # Night behavior: no ambient-light sensor on this board, so drive the backlight from office
+  # occupancy — full brightness when someone's there, dim when the room's empty (saves the panel,
+  # no 2am glare). Fades so it's not jarring.
+  - platform: homeassistant
+    id: package_waiting
+    entity_id: input_boolean.package_waiting
+    on_state:
+      - if:
+          condition: {lambda: 'return x;'}
+          then: [{lvgl.widget.show: pkg_note}]
+          else: [{lvgl.widget.hide: pkg_note}]
+      - script.execute: layout_badges
+  - platform: homeassistant
+    id: office_occupancy
+    entity_id: "${occupancy_sensor}"
+    on_state:
+      - if:
+          condition: {lambda: 'return x;'}
+          then:
+            - light.turn_on: {id: backlight, brightness: 80%, transition_length: 800ms}
+          else:
+            - light.turn_on: {id: backlight, brightness: 12%, transition_length: 1500ms}
+
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+
+spi:
+  id: display_qspi
+  type: quad
+  clk_pin: GPIO40
+  data_pins: [GPIO46, GPIO45, GPIO42, GPIO41]
+
+switch:
+  - platform: gpio
+    pin: GPIO18
+    id: lcd_te
+    internal: true
+  # TP_RST (touch reset) = PCA9554 EXIO1 (active-low). SINGLE OWNER of this pin — the cst816 component
+  # must NOT declare reset_pin (its post-init write on EXIO1 races the display's EXIO2 reset and blanks
+  # the ST77916). ALWAYS_OFF holds reset asserted (LOW) at switch setup(800); on_boot@700 pulses it high
+  # to wake the chip before the touch component's setup(600) writes IRQ_EN_MOTION.
+  - platform: gpio
+    id: tp_reset
+    internal: true
+    pin: {pca9554: tca9554_dev, number: 0}   # EXIO1 pulse didn't wake the chip; trying EXIO0 (research's other TP_RST candidate)
+    restore_mode: ALWAYS_OFF
+
+# ─── VOICE: "Okay Nabu" wake word → HA Assist pipeline. Audio pins from the working v17 firmware. ───
+i2s_audio:
+  - id: i2s_out
+    i2s_lrclk_pin: GPIO38
+    i2s_bclk_pin: GPIO48
+  - id: i2s_in
+    i2s_lrclk_pin: GPIO2
+    i2s_bclk_pin: GPIO15
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_speaker
+    i2s_audio_id: i2s_out
+    i2s_dout_pin: GPIO47
+    dac_type: external
+    channel: stereo
+
+microphone:
+  - platform: i2s_audio
+    id: i2s_microphone
+    i2s_audio_id: i2s_in
+    i2s_din_pin: GPIO39
+    adc_type: external
+    pdm: false
+    channel: right
+    sample_rate: 16000
+
+micro_wake_word:
+  id: mww
+  models:
+    - model: hey_jarvis
+  on_wake_word_detected:
+    - script.execute: duck_music # drop the Sonos BEFORE listening — the mic is across the room from it
+    - micro_wake_word.stop:      # stop listening for the wake word while the assistant runs (frees audio/CPU)
+    - voice_assistant.start:
+
+voice_assistant:
+  id: va
+  microphone: i2s_microphone
+  speaker: i2s_speaker
+  use_wake_word: false
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 2.0
+  # PHASE COLOR = tint overlay + matching spinner indicator, so the orb itself reads the phase
+  # rather than only the wash behind it. cyan=listening, amber=thinking, teal=speaking.
+  on_listening:
+    - lambda: 'id(va_active) = true;'
+    - lvgl.widget.show: va_tint_blue
+    - lvgl.widget.hide: va_tint_amber
+    - lvgl.widget.hide: va_tint_teal
+    - lvgl.widget.hide: va_hint
+    - lvgl.widget.update:
+        id: va_spin
+        indicator:
+          arc_color: 0x7FE9FF
+    - lvgl.label.update: {id: va_prompt, text: "Listening…"}
+    - lvgl.label.update: {id: va_reply, text: ""}
+    - lvgl.page.show: voice_page
+    - script.execute:            # long backstop: covers a wedged mic/STT that never reaches on_stt_end
+        id: va_watchdog
+        secs: 45
+  on_stt_end:        # amber → thinking; show what it heard
+    - lvgl.label.update: {id: va_prompt, text: !lambda 'return x.empty() ? std::string("…") : x;'}
+    - lvgl.widget.hide: va_tint_blue
+    - lvgl.widget.show: va_tint_amber
+    - lvgl.widget.update:
+        id: va_spin
+        indicator:
+          arc_color: 0xFFC24D
+    - script.execute:            # THE tailspin window: intent/LLM budget. Re-arms (mode: restart).
+        id: va_watchdog
+        secs: 20
+  on_tts_start:      # teal → speaking; show the reply + tap-to-stop hint
+    - script.stop: va_watchdog   # it answered — a long reply is legitimate, don't kill it
+    - lvgl.label.update: {id: va_reply, text: !lambda 'return x;'}
+    - lvgl.widget.hide: va_tint_amber
+    - lvgl.widget.show: va_tint_teal
+    - lvgl.widget.show: va_hint
+    - lvgl.widget.update:
+        id: va_spin
+        indicator:
+          arc_color: 0x5FF2E4
+  on_timer_started:
+    - script.execute: timer_show
+  on_timer_updated:
+    - script.execute: timer_show
+  on_timer_cancelled:
+    - script.execute: timer_hide
+  on_timer_finished:
+    - script.execute: timer_finished_show
+  on_timer_tick:
+    - lambda: |-
+        // Drive the cover from the SOONEST active timer. Fields verified against the ESPHome
+        // API docs: total_seconds / seconds_left / is_active.
+        uint32_t left = 0, total = 0;
+        bool found = false;
+        for (auto &t : timers) {
+          if (!t.is_active) continue;
+          if (!found || t.seconds_left < left) { left = t.seconds_left; total = t.total_seconds; found = true; }
+        }
+        if (!found) return;                     // cancelled/finished handle their own teardown
+        float frac = (total > 0) ? (float) left / (float) total : 0.0f;
+        if (frac < 0.0f) frac = 0.0f;
+        if (frac > 1.0f) frac = 1.0f;
+        // Cover spans the REMAINING fraction, anchored at 12 o'clock; it peels clockwise.
+        // NOTE: bg_angles, not set_angles — set_angles moves the INDICATOR, and the colour
+        // lives on LV_PART_MAIN (the background arc), same as the forecast segments.
+        float elapsed_deg = (1.0f - frac) * 360.0f;
+        if (elapsed_deg < 0.5f) elapsed_deg = 0.5f;   // start == end is degenerate in LVGL
+        int start = ((int) (270.0f + elapsed_deg)) % 360;
+        lv_arc_set_bg_angles(id(timer_cover), start, 270);
+        char buf[16];
+        if (left >= 3600) snprintf(buf, sizeof(buf), "%u:%02u:%02u", left / 3600, (left % 3600) / 60, left % 60);
+        else              snprintf(buf, sizeof(buf), "%u:%02u", left / 60, left % 60);
+        lv_label_set_text(id(timer_value), buf);
+  on_end:
+    - script.stop: va_watchdog
+    - script.execute: unduck_music
+    # 400ms before re-arming: the puck was caught IDLE-but-DEAF for 24s and only the
+    # self-heal recovered it. Best hypothesis — mww.start was called the instant the assistant
+    # ended, while TTS audio was still releasing the mic, and silently failed. The self-heal is
+    # the backstop; this is the actual fix attempt.
+    - delay: 400ms
+    - micro_wake_word.start:
+    - delay: 2600ms
+    - lambda: 'id(va_active) = false;'
+    - script.execute: return_to_prev_page
+  on_error:
+    - script.stop: va_watchdog
+    - script.execute: unduck_music
+    - micro_wake_word.start:
+    - lvgl.label.update: {id: va_reply, text: "Sorry — try again"}
+    - lvgl.widget.hide: va_tint_blue
+    - lvgl.widget.hide: va_tint_amber
+    - lvgl.widget.show: va_tint_teal
+    - lvgl.widget.update:
+        id: va_spin
+        indicator:
+          arc_color: 0xFF6B6B     # red — the one phase that isn't a normal transition
+    - delay: 2500ms
+    - lambda: 'id(va_active) = false;'
+    - script.execute: return_to_prev_page
+
+# Full-screen radial-glow background (swap `file` to change: glow_blue/teal/ember/indigo,
+# or drop in a scrimmed photo). 360x360 RGB565 — ~253KB, easily fits 8MB PSRAM / 16MB flash.
+image:
+  - file: backgrounds/glow_blue.png
+    id: bg_glow
+    type: RGB565
+  # ── weather backgrounds (Gemini art, split to 360x360) — swapped on the clock screen by condition ──
+  - {file: backgrounds/bg_sunny.png,        id: wx_sunny,        type: RGB565}
+  - {file: backgrounds/bg_clear_night.png,  id: wx_clear_night,  type: RGB565}
+  - {file: backgrounds/bg_partlycloudy.png, id: wx_partlycloudy, type: RGB565}
+  - {file: backgrounds/bg_cloudy.png,       id: wx_cloudy,       type: RGB565}
+  - {file: backgrounds/bg_rainy.png,        id: wx_rainy,        type: RGB565}
+  - {file: backgrounds/bg_pouring.png,      id: wx_pouring,      type: RGB565}
+  - {file: backgrounds/bg_snowy.png,        id: wx_snowy,        type: RGB565}
+  - {file: backgrounds/bg_fog.png,          id: wx_fog,          type: RGB565}
+  - {file: backgrounds/bg_lightning.png,    id: wx_lightning,    type: RGB565}
+  - {file: backgrounds/bg_windy.png,        id: wx_windy,        type: RGB565}
+  - {file: backgrounds/bg_hail.png,         id: wx_hail,         type: RGB565}
+  # ── thermostat mode backgrounds (Gemini art, 300px, scaled to fill) ──
+  - {file: backgrounds/bg_heat.png,     id: tm_heat,     type: RGB565}
+  - {file: backgrounds/bg_cool.png,     id: tm_cool,     type: RGB565}
+  - {file: backgrounds/bg_heatcool.png, id: tm_heatcool, type: RGB565}
+  - {file: backgrounds/bg_off.png,      id: tm_off,      type: RGB565}
+  # voice view background (neural network, Gemini) — calm dark center for the orb + text
+  - {file: backgrounds/voice_neural.png, id: neural_bg,  type: RGB565}
+
+# ── Album art: fetch the current track's cover from HA at runtime, show as the media background ──
+http_request:
+  timeout: 10s
+  verify_ssl: false
+
+online_image:
+  - id: album_art
+    url: "${ha_base_url}/"   # placeholder; real URL set at runtime from entity_picture
+    format: JPEG
+    type: RGB565
+    resize: 360x360
+    update_interval: never
+    on_download_finished:
+      - lvgl.image.update: {id: media_bg, src: album_art}
+    on_error:
+      - logger.log: "album art download failed"
+
+  # ── Doorbell porthole frame ──────────────────────────────────────────────────────────
+  # Frigate resizes SERVER-SIDE (`?height=240` -> 426x240, ~23KB). This is the whole reason the
+  # porthole is safe: the alternative is decoding the native frame on the ESP32, and a blocking
+  # decode is the prime suspect for the loop stall that garbled the panel. Keep the
+  # resize upstream. `height` is the ONLY param Frigate 0.17 honours -- `h`/`w`/`size` are all
+  # silently IGNORED and hand back the full frame, which looks identical until you check dims.
+  - id: doorbell_snap
+    url: "${frigate_base_url}/api/doorbell/latest.jpg?height=360"
+    format: JPEG
+    type: RGB565
+    resize: 640x360
+    update_interval: never       # fetched on demand when the bell rings, never polled
+    on_download_finished:
+      - lvgl.image.update: {id: db_img, src: doorbell_snap}
+      - script.execute: {id: doorbell_show, have_img: true}
+    on_error:
+      - logger.log: "doorbell snapshot download FAILED - showing modal without a frame"
+      # Deliberately do NOT fall back to the last good frame: online_image keeps the PREVIOUS
+      # download in its buffer, so a stale frame would show the LAST visitor's face as if it
+      # were the person at the door right now. A bell icon is honest; a wrong face is not.
+      - script.execute: {id: doorbell_show, have_img: false}
+
+font:
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: roboto_clock
+    size: 60
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_abcdefghijklmnopqrstuvwxyz{|}~°"
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: roboto_label
+    size: 22
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_abcdefghijklmnopqrstuvwxyz{|}~°·’‘“”–—…éèêëáàâäíìîïóòôöúùûüñç"
+  # Gemini-mock layout: center clock
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 600
+    id: roboto_time
+    size: 44
+    glyphs: " 0123456789:APM"
+  # big indoor/outdoor temp values
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 500
+    id: roboto_temp
+    size: 36
+    glyphs: " 0123456789°-"
+  # tiny uppercase labels (INDOOR / OUTDOOR / MUSIC)
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 500
+    id: roboto_tiny
+    size: 13
+    glyphs: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789·.,°"
+  # Design B: small caps-y date / label weight
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 500
+    id: roboto_small
+    size: 18
+    glyphs: " !\"#%&'()*+,-./0123456789:;°ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz·"
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_64
+    size: 64
+    glyphs: ["\U000F0599", "\U000F0594", "\U000F0595", "\U000F0590", "\U000F0591", "\U000F0597", "\U000F0596", "\U000F0593", "\U000F067E", "\U000F0598", "\U000F067F", "\U000F059D", "\U000F0592"]
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_22
+    size: 22
+    glyphs: ["\U000F0F54", "\U000F050F", "\U000F02DC", "\U000F075A", "\U000F040A"]
+  # small weather glyph set for the outdoor cluster (same codepoints as mdi_64)
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_28
+    size: 28
+    glyphs: ["\U000F0599", "\U000F0594", "\U000F0595", "\U000F0590", "\U000F0591", "\U000F0597", "\U000F0596", "\U000F0593", "\U000F067E", "\U000F0598", "\U000F067F", "\U000F059D", "\U000F0592", "\U000F02DC"]
+  # FORECAST-RING precip glyphs. Small: these sit in the bezel annulus, 12 of them.
+  # water F058C (1-3 = light/steady/hard), lightning-bolt F140B (storm), snowflake F0717 (snow).
+  # EVERY codepoint used must be listed here — an undeclared glyph renders as a box, which is how
+  # the missing ° and the home icon bit us before. Verified present in the MDI webfont.
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_modal
+    size: 44
+    # doorbell + alert-circle. Codepoints VERIFIED by ink-test against this exact webfont, not
+    # read off a table -- MDI's meta.json ships codepoints newer than the pinned font, and a
+    # glyph missing from the FONT renders as a silent tofu box (bitten 3x on this project).
+    glyphs: ["\U000F12E6", "\U000F0028"]
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_precip
+    size: 12
+    glyphs: ["\U000F058C", "\U000F140B", "\U000F0717"]
+  # music PRESENCE glyph (F075A) — the main page shows only "something is playing", not what.
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_note
+    size: 20
+    glyphs: ["\U000F075A", "\U000F03D6", "\U000F1084"]
+  # thermostat: big target temperature
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 500
+    id: roboto_big
+    size: 68
+    glyphs: " 0123456789°"
+  # media title / now-playing (bigger than the tiny labels; broad glyph set for song + artist text)
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 500
+    id: roboto_media
+    size: 26
+    # broad set for song/artist text; ignore_missing_glyphs => unknown chars render blank, never as boxes
+    ignore_missing_glyphs: true
+    glyphs: " !\"#$%&'()*+,-./0123456789:;?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_abcdefghijklmnopqrstuvwxyz·’‘“”–—…ÀÁÂÄÅÆÈÉÊËÌÍÎÏÑÒÓÔÖØÙÚÛÜŸÇàáâäåæèéêëìíîïñòóôöøùúûüÿç"
+  # control-zone glyphs (bigger tap targets): minus F0374, plus F0415, fan F0210, play F040A,
+  # pause F03E4, volume-plus F075D, volume-minus F075E  (codepoints verified against MDI webfont)
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_btn
+    size: 64
+    glyphs: ["\U000F0374", "\U000F0415", "\U000F0210", "\U000F040A", "\U000F03E4", "\U000F075D", "\U000F075E"]
+
+display:
+  - platform: mipi_spi        # migrated from deprecated qspi_dbi; maintained driver, better reset handling
+    model: CUSTOM
+    bus_mode: quad
+    id: main_display
+    spi_id: display_qspi
+    data_rate: 40MHz
+    invert_colors: true
+    color_order: rgb
+    dimensions:
+      height: 360
+      width: 360
+    cs_pin: GPIO21
+    reset_pin:
+      # THE ONE REAL FIX: LCD_RST = PCA9554 EXIO2. Pin 1 is TP_RST (touch reset);
+      # driving the wrong pin left the ST77916 un-reset -> intermittent static-on-boot
+      # (the whole "fuzz" saga). With EXIO2 the panel resets reliably and the original
+      # (correct-for-this-unit) init sequence renders clean + bright. Do NOT change to
+      # the ulsmith/1.85C init or 80MHz — those are for a different unit and render dim
+      # here. This unit is clean at: old init + 40MHz + default buffer + little_endian.
+      pca9554: tca9554_dev
+      number: 2
+    auto_clear_enabled: false
+    update_interval: never
+    init_sequence:
+      - [ 0xF0, 0x08 ]
+      - [ 0xF2, 0x08 ]
+      - [ 0x9B, 0x51 ]
+      - [ 0x86, 0x53 ]
+      - [ 0xF2, 0x80 ]
+      - [ 0xF0, 0x00 ]
+      - [ 0xF0, 0x01 ]
+      - [ 0xF1, 0x01 ]
+      - [ 0xB0, 0x54 ]
+      - [ 0xB1, 0x3F ]
+      - [ 0xB2, 0x2A ]
+      - [ 0xB4, 0x46 ]
+      - [ 0xB5, 0x34 ]
+      - [ 0xB6, 0xD5 ]
+      - [ 0xB7, 0x30 ]
+      - [ 0xBA, 0x00 ]
+      - [ 0xBB, 0x08 ]
+      - [ 0xBC, 0x08 ]
+      - [ 0xBD, 0x00 ]
+      - [ 0xC0, 0x80 ]
+      - [ 0xC1, 0x10 ]
+      - [ 0xC2, 0x37 ]
+      - [ 0xC3, 0x80 ]
+      - [ 0xC4, 0x10 ]
+      - [ 0xC5, 0x37 ]
+      - [ 0xC6, 0xA9 ]
+      - [ 0xC7, 0x41 ]
+      - [ 0xC8, 0x51 ]
+      - [ 0xC9, 0xA9 ]
+      - [ 0xCA, 0x41 ]
+      - [ 0xCB, 0x51 ]
+      - [ 0xD0, 0x91 ]
+      - [ 0xD1, 0x68 ]
+      - [ 0xD2, 0x69 ]
+      - [ 0xF5, 0x00, 0xA5 ]
+      - [ 0xDD, 0x3F ]
+      - [ 0xDE, 0x3F ]
+      - [ 0xF1, 0x10 ]
+      - [ 0xF0, 0x00 ]
+      - [ 0xF0, 0x02 ]
+      - [ 0xE0, 0xF0, 0x06, 0x0B, 0x09, 0x09, 0x16, 0x32, 0x44, 0x4A, 0x37, 0x13, 0x13, 0x2E, 0x34 ]
+      - [ 0xE1, 0xF0, 0x06, 0x0B, 0x09, 0x08, 0x05, 0x32, 0x33, 0x49, 0x17, 0x13, 0x13, 0x2E, 0x34 ]
+      - [ 0xF0, 0x10 ]
+      - [ 0xF3, 0x10 ]
+      - [ 0xE0, 0x0A ]
+      - [ 0xE1, 0x00 ]
+      - [ 0xE2, 0x00 ]
+      - [ 0xE3, 0x00 ]
+      - [ 0xE4, 0xE0 ]
+      - [ 0xE5, 0x06 ]
+      - [ 0xE6, 0x21 ]
+      - [ 0xE7, 0x00 ]
+      - [ 0xE8, 0x05 ]
+      - [ 0xE9, 0x82 ]
+      - [ 0xEA, 0xDF ]
+      - [ 0xEB, 0x89 ]
+      - [ 0xEC, 0x20 ]
+      - [ 0xED, 0x14 ]
+      - [ 0xEE, 0xFF ]
+      - [ 0xEF, 0x00 ]
+      - [ 0xF8, 0xFF ]
+      - [ 0xF9, 0x00 ]
+      - [ 0xFA, 0x00 ]
+      - [ 0xFB, 0x30 ]
+      - [ 0xFC, 0x00 ]
+      - [ 0xFD, 0x00 ]
+      - [ 0xFE, 0x00 ]
+      - [ 0xFF, 0x00 ]
+      - [ 0x60, 0x42 ]
+      - [ 0x61, 0xE0 ]
+      - [ 0x62, 0x40 ]
+      - [ 0x63, 0x40 ]
+      - [ 0x64, 0x02 ]
+      - [ 0x65, 0x00 ]
+      - [ 0x66, 0x40 ]
+      - [ 0x67, 0x03 ]
+      - [ 0x68, 0x00 ]
+      - [ 0x69, 0x00 ]
+      - [ 0x6A, 0x00 ]
+      - [ 0x6B, 0x00 ]
+      - [ 0x70, 0x42 ]
+      - [ 0x71, 0xE0 ]
+      - [ 0x72, 0x40 ]
+      - [ 0x73, 0x40 ]
+      - [ 0x74, 0x02 ]
+      - [ 0x75, 0x00 ]
+      - [ 0x76, 0x40 ]
+      - [ 0x77, 0x03 ]
+      - [ 0x78, 0x00 ]
+      - [ 0x79, 0x00 ]
+      - [ 0x7A, 0x00 ]
+      - [ 0x7B, 0x00 ]
+      - [ 0x80, 0x48 ]
+      - [ 0x81, 0x00 ]
+      - [ 0x82, 0x05 ]
+      - [ 0x83, 0x02 ]
+      - [ 0x84, 0xDD ]
+      - [ 0x85, 0x00 ]
+      - [ 0x86, 0x00 ]
+      - [ 0x87, 0x00 ]
+      - [ 0x88, 0x48 ]
+      - [ 0x89, 0x00 ]
+      - [ 0x8A, 0x07 ]
+      - [ 0x8B, 0x02 ]
+      - [ 0x8C, 0xDF ]
+      - [ 0x8D, 0x00 ]
+      - [ 0x8E, 0x00 ]
+      - [ 0x8F, 0x00 ]
+      - [ 0x90, 0x48 ]
+      - [ 0x91, 0x00 ]
+      - [ 0x92, 0x09 ]
+      - [ 0x93, 0x02 ]
+      - [ 0x94, 0xE1 ]
+      - [ 0x95, 0x00 ]
+      - [ 0x96, 0x00 ]
+      - [ 0x97, 0x00 ]
+      - [ 0x98, 0x48 ]
+      - [ 0x99, 0x00 ]
+      - [ 0x9A, 0x0B ]
+      - [ 0x9B, 0x02 ]
+      - [ 0x9C, 0xE3 ]
+      - [ 0x9D, 0x00 ]
+      - [ 0x9E, 0x00 ]
+      - [ 0x9F, 0x00 ]
+      - [ 0xA0, 0x48 ]
+      - [ 0xA1, 0x00 ]
+      - [ 0xA2, 0x04 ]
+      - [ 0xA3, 0x02 ]
+      - [ 0xA4, 0xDC ]
+      - [ 0xA5, 0x00 ]
+      - [ 0xA6, 0x00 ]
+      - [ 0xA7, 0x00 ]
+      - [ 0xA8, 0x48 ]
+      - [ 0xA9, 0x00 ]
+      - [ 0xAA, 0x06 ]
+      - [ 0xAB, 0x02 ]
+      - [ 0xAC, 0xDE ]
+      - [ 0xAD, 0x00 ]
+      - [ 0xAE, 0x00 ]
+      - [ 0xAF, 0x00 ]
+      - [ 0xB0, 0x48 ]
+      - [ 0xB1, 0x00 ]
+      - [ 0xB2, 0x08 ]
+      - [ 0xB3, 0x02 ]
+      - [ 0xB4, 0xE0 ]
+      - [ 0xB5, 0x00 ]
+      - [ 0xB6, 0x00 ]
+      - [ 0xB7, 0x00 ]
+      - [ 0xB8, 0x48 ]
+      - [ 0xB9, 0x00 ]
+      - [ 0xBA, 0x0A ]
+      - [ 0xBB, 0x02 ]
+      - [ 0xBC, 0xE2 ]
+      - [ 0xBD, 0x00 ]
+      - [ 0xBE, 0x00 ]
+      - [ 0xBF, 0x00 ]
+      - [ 0xC0, 0x12 ]
+      - [ 0xC1, 0xAA ]
+      - [ 0xC2, 0x65 ]
+      - [ 0xC3, 0x74 ]
+      - [ 0xC4, 0x47 ]
+      - [ 0xC5, 0x56 ]
+      - [ 0xC6, 0x00 ]
+      - [ 0xC7, 0x88 ]
+      - [ 0xC8, 0x99 ]
+      - [ 0xC9, 0x33 ]
+      - [ 0xD0, 0x21 ]
+      - [ 0xD1, 0xAA ]
+      - [ 0xD2, 0x65 ]
+      - [ 0xD3, 0x74 ]
+      - [ 0xD4, 0x47 ]
+      - [ 0xD5, 0x56 ]
+      - [ 0xD6, 0x00 ]
+      - [ 0xD7, 0x88 ]
+      - [ 0xD8, 0x99 ]
+      - [ 0xD9, 0x33 ]
+      - [ 0xF3, 0x01 ]
+      - [ 0xF0, 0x00 ]
+      - [ 0xF0, 0x01 ]
+      - [ 0xF1, 0x01 ]
+      - [ 0xA0, 0x0B ]
+      - [ 0xA3, 0x2A ]
+      - [ 0xA5, 0xC3 ]
+      - delay 1ms
+      - [ 0xA3, 0x2B ]
+      - [ 0xA5, 0xC3 ]
+      - delay 1ms
+      - [ 0xA3, 0x2C ]
+      - [ 0xA5, 0xC3 ]
+      - delay 1ms
+      - [ 0xA3, 0x2D ]
+      - [ 0xA5, 0xC3 ]
+      - delay 1ms
+      - [ 0xA3, 0x2E ]
+      - [ 0xA5, 0xC3 ]
+      - delay 1ms
+      - [ 0xA3, 0x2F ]
+      - [ 0xA5, 0xC3 ]
+      - delay 1ms
+      - [ 0xA3, 0x30 ]
+      - [ 0xA5, 0xC3 ]
+      - delay 1ms
+      - [ 0xA3, 0x31 ]
+      - [ 0xA5, 0xC3 ]
+      - delay 1ms
+      - [ 0xA3, 0x32 ]
+      - [ 0xA5, 0xC3 ]
+      - delay 1ms
+      - [ 0xA3, 0x33 ]
+      - [ 0xA5, 0xC3 ]
+      - delay 1ms
+      - [ 0xA0, 0x09 ]
+      - [ 0xF1, 0x10 ]
+      - [ 0xF0, 0x00 ]
+      - [ 0x2A, 0x00, 0x00, 0x01, 0x67 ]
+      - [ 0x2B, 0x01, 0x68, 0x01, 0x68 ]
+      - [ 0x4D, 0x00 ]
+      - [ 0x4E, 0x00 ]
+      - [ 0x4F, 0x00 ]
+      - [ 0x4C, 0x01 ]
+      - delay 10ms
+      - [ 0x4C, 0x00 ]
+      - [ 0x2A, 0x00, 0x00, 0x01, 0x67 ]
+      - [ 0x2B, 0x00, 0x00, 0x01, 0x67 ]
+      - [ 0x3A, 0x55 ]
+      - [ 0x21, 0x00 ]
+      - [ 0x11, 0x00 ]
+      - delay 120ms
+      - [ 0x29, 0x00 ]
+
+# CST816 touch. TP_RST = PCA9554 EXIO0 (confirmed: pulsing it at boot makes the chip read CST816T
+# instead of "Unknown"); display LCD_RST = EXIO2, so the two no longer fight. The cst816 component
+# owns NO reset_pin (our on_boot switch owns EXIO0). POLLING mode (update_interval, NO interrupt_pin):
+# the board's INT pin is unverified (its pin map already diverged on TP_RST) and USB serial streaming
+# stalls, so we poll the chip on a timer and publish a touch counter to HA for reliable observation.
+touchscreen:
+  - platform: cst816
+    id: my_touchscreen
+    i2c_id: main_i2c
+    update_interval: 50ms
+    skip_probe: true
+    display: main_display
+    # ORIENTATION — set from 2-corner calibration (chip raw coords vs what the user sees). Identity until then.
+    transform:
+      swap_xy: false
+      mirror_x: false
+      mirror_y: false
+    # BIG-ZONE tap model (coords are display-space after `transform:` above): top half cycles screens;
+    # bottom half is split L/M/R and acts on whichever screen is showing. One action per tap (on_release).
+    on_touch:
+      - lambda: |-
+          id(touch_start_x) = touch.x; id(touch_start_y) = touch.y;
+          id(touch_count) += 1;
+          id(touch_count_sensor).publish_state(id(touch_count));
+          // ROTATION COMPENSATION (lvgl rotation: 180). LVGL rotates touch coords for ITS OWN
+          // widgets, but this lambda is a touchscreen callback — it runs BEFORE/outside LVGL and
+          // still sees unrotated chip coords. So map raw -> visual here: visual = 359 - raw.
+          // Do NOT "fix" this by adding mirror_x/mirror_y to the touchscreen `transform:` — that
+          // feeds LVGL too, and LVGL would rotate on top of it, double-flipping any interactive
+          // LVGL widget. Compensating locally keeps LVGL's own coordinate space correct.
+          int x = 359 - touch.x, y = 359 - touch.y, z;
+          if (y < 180) z = 0;             // top half -> cycle
+          else if (x < 120) z = 1;        // bottom-left  -> decrease
+          else if (x < 240) z = 2;        // bottom-mid   -> stop/start
+          else z = 3;                     // bottom-right -> increase
+          id(tap_zone) = z;
+          id(touch_debug).publish_state(str_sprintf("(%d,%d) z=%d", x, y, z));
+    on_release:
+      - if:   # AN OPEN MODAL (doorbell/alert) -> any tap dismisses it (and consumes the tap)
+          condition: {lambda: 'return id(modal_open) != 0;'}
+          then:
+            - script.stop: doorbell_show   # kill the pending auto-close or it fires later
+            - script.stop: alert_show      #   and yanks the user off a page he navigated to himself
+            - script.stop: weather_alert_show
+            - script.execute: modal_hide
+            - lambda: 'id(tap_zone) = -1;'
+      - if:   # A FIRED TIMER -> any tap dismisses it (and consumes the tap)
+          condition: {lambda: 'return id(timer_done);'}
+          then:
+            - script.stop: timer_finished_show
+            - script.execute: timer_hide
+            - lambda: 'id(tap_zone) = -1;'
+      - if:   # VOICE ACTIVE -> any tap cancels it (and consumes the tap so it doesn't also navigate)
+          condition: {lambda: 'return id(va_active);'}
+          then:
+            - script.stop: va_watchdog   # cancel first — else it fires later on a dead interaction
+            - script.execute: unduck_music
+            - voice_assistant.stop:
+            - lambda: 'id(va_active) = false; id(tap_zone) = -1;'
+            - script.execute: return_to_prev_page
+            - micro_wake_word.start:
+      - if:   # TOP HALF -> next screen
+          condition: {lambda: 'return id(tap_zone) == 0;'}
+          then:
+            - lvgl.page.next: {animation: MOVE_LEFT, time: 200ms}
+      # ── THERMOSTAT screen: - / fan-toggle / + ──
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(tap_zone) == 1;'
+              - lvgl.page.is_showing: thermostat_page
+          then: [{script.execute: {id: adjust_thermostat, delta: -1.0}}]
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(tap_zone) == 3;'
+              - lvgl.page.is_showing: thermostat_page
+          then: [{script.execute: {id: adjust_thermostat, delta: 1.0}}]
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(tap_zone) == 2;'
+              - lvgl.page.is_showing: thermostat_page
+          then:
+            # optimistic: flip fan_on + recolor the icon INSTANTLY, then send the command; the HA
+            # fan_mode sensor confirms/corrects the color when the thermostat actually reports back.
+            - lambda: 'id(fan_on) = !id(fan_on);'
+            - if:
+                condition: {lambda: 'return id(fan_on);'}
+                then: [{lvgl.label.update: {id: fan_hint_icon, text_color: 0x4FA8FF}}]
+                else: [{lvgl.label.update: {id: fan_hint_icon, text_color: 0x9AA6BB}}]
+            - homeassistant.action:
+                action: climate.set_fan_mode
+                data:
+                  entity_id: "${climate_entity}"
+                  fan_mode: !lambda 'return id(fan_on) ? std::string("on") : std::string("off");'
+      # ── MEDIA screen: vol- / play-pause / vol+ ──
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(tap_zone) == 1;'
+              - lvgl.page.is_showing: media_page
+          then:
+            - homeassistant.action: {action: media_player.volume_down, data: {entity_id: "${media_player_native}"}}
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(tap_zone) == 3;'
+              - lvgl.page.is_showing: media_page
+          then:
+            - homeassistant.action: {action: media_player.volume_up, data: {entity_id: "${media_player_native}"}}
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(tap_zone) == 2;'
+              - lvgl.page.is_showing: media_page
+          then:
+            - homeassistant.action: {action: media_player.media_play_pause, data: {entity_id: "${media_player_native}"}}
+      # ── CLOCK screen: bottom-middle also toggles play/pause (taps the now-playing line) ──
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(tap_zone) == 2;'
+              - lvgl.page.is_showing: main_page
+          then:
+            - homeassistant.action: {action: media_player.media_play_pause, data: {entity_id: "${media_player_native}"}}
+
+globals:
+  - id: ui_target          # on-device working target (NAN = follow HA); optimistic +/- feel
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: touch_start_x
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: touch_start_y
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: touch_last_x
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: touch_last_y
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: touch_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: touch_count       # cumulative touches, published to HA so I can verify touch fires without serial
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: tap_zone          # last tap's zone: 0=top(cycle) 1=bottom-left 2=bottom-mid 3=bottom-right
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: fan_on            # mirrors ${climate_entity} fan_mode=="on" (for the toggle + icon)
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: va_active         # true while a voice interaction is in progress (tap anywhere to cancel it)
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: current_page      # 0=clock 1=thermostat 2=media — set by each page's on_load, so the modal
+    type: int             # voice_page can return you to WHERE YOU WERE instead of always the clock.
+    restore_value: no     # voice_page deliberately does NOT set it (it's skip:true and transient).
+    initial_value: "0"
+  - id: timer_done       # a timer has FIRED and is showing DONE — next tap dismisses it
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: modal_open       # 0 none | 1 doorbell | 2 alert. An open modal OWNS the next tap
+    type: int             # (dismiss) and must not also navigate -- same contract as timer_done.
+    restore_value: no
+    initial_value: "0"
+  - id: camera_title      # what the porthole scrim says — set by whichever HA action fired it
+    type: std::string
+    restore_value: no
+    initial_value: '"Front door"'
+  - id: rain_warned       # edge-trigger latch: alert once when precip ENTERS the next 2h, not
+    type: bool            # every 10min while it keeps raining; resets when the window dries out
+    restore_value: no
+    initial_value: "false"
+  - id: pre_duck_vol      # Office Sonos volume before ducking, so restore is EXACT, not a guess.
+    type: float
+    restore_value: no
+    initial_value: "0.44"
+  - id: is_ducked         # guards restore: only un-duck if we actually ducked
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+script:
+  # ── WEATHER-STYLED ALERT ────────────────────────────────────────────────────────────────
+  # Same modal, dressed for the message: the existing weather backgrounds + the matching
+  # condition glyph, behind a light scrim. kind: storm | pouring | rain | snow | haze.
+  - id: weather_alert_show
+    mode: restart
+    parameters:
+      kind: string
+      title: string
+      message: string
+    then:
+      - script.execute: {id: alert_show, title: !lambda 'return title;', message: !lambda 'return message;'}
+      - if:
+          condition: {lambda: 'return kind == "storm";'}
+          then: [{lvgl.image.update: {id: al_bg, src: wx_lightning}}, {lvgl.label.update: {id: al_wx_icon, text: "\U000F0593"}}]
+      - if:
+          condition: {lambda: 'return kind == "pouring";'}
+          then: [{lvgl.image.update: {id: al_bg, src: wx_pouring}}, {lvgl.label.update: {id: al_wx_icon, text: "\U000F0596"}}]
+      - if:
+          condition: {lambda: 'return kind == "rain";'}
+          then: [{lvgl.image.update: {id: al_bg, src: wx_rainy}}, {lvgl.label.update: {id: al_wx_icon, text: "\U000F0597"}}]
+      - if:
+          condition: {lambda: 'return kind == "snow";'}
+          then: [{lvgl.image.update: {id: al_bg, src: wx_snowy}}, {lvgl.label.update: {id: al_wx_icon, text: "\U000F0598"}}]
+      - if:
+          condition: {lambda: 'return kind == "haze";'}
+          then: [{lvgl.image.update: {id: al_bg, src: wx_fog}}, {lvgl.label.update: {id: al_wx_icon, text: "\U000F0591"}}]
+      - lvgl.widget.show: al_bg
+      - lvgl.widget.hide: al_icon
+      - lvgl.widget.show: al_wx_icon
+      - lvgl.widget.update: {id: al_scrim, bg_color: 0x0B0E13, bg_opa: 45%}
+
+  # ── THERMOSTAT DELTA RING ───────────────────────────────────────────────────────────────
+  - id: update_therm_ring
+    mode: single
+    then:
+      - lambda: |-
+          // v3 (the user's model): the FILL's leading edge is the ROOM (current), the
+          // white TICK is the GOAL (target), and the fill is anchored at the end the
+          // temperature is COMING FROM — heat rises from the cold/left end clockwise, cooling
+          // descends from the hot/right end counter-clockwise, each sweeping toward the tick
+          // until edge touches tick (= at setpoint, calm). Direction of travel tells you
+          // heating-vs-cooling before you read a number. (v2 anchored left always and tick'd
+          // CURRENT — the user read the tick as target anyway, and his reading was better.)
+          float cur = id(therm_current).state;
+          float tgt = isnan(id(ui_target)) ? id(therm_target).state : id(ui_target);
+          auto ang = [](float t) -> float {
+            if (t < 60) t = 60;
+            if (t > 80) t = 80;
+            return 135.0f + (t - 60.0f) * 13.5f;           // 60–80°F -> 135°–405° dial
+          };
+          std::string mode = id(climate_mode).state;
+          bool cool_style = (mode == "cool") || (mode == "heat_cool" && !isnan(tgt) && cur > tgt);
+          if (isnan(cur)) {
+            lv_arc_set_angles(id(therm_ring), 135, 135);
+          } else if (cool_style) {
+            // fill = [current .. hot end], edge sweeps CCW toward the tick as the room cools
+            lv_arc_set_angles(id(therm_ring), (int) ang(cur) % 360, 45);
+          } else {
+            // fill = [cold end .. current], edge sweeps CW toward the tick as the room heats
+            // (end < start wraps through 0 in LVGL — exactly the dial's 360..405 tail)
+            lv_arc_set_angles(id(therm_ring), 135, (int) ang(cur) % 360);
+          }
+          if (isnan(tgt)) {
+            lv_obj_add_flag(id(therm_now_tick), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            int a = (int) ang(tgt);
+            lv_arc_set_bg_angles(id(therm_now_tick), (a - 2 + 360) % 360, (a + 2) % 360);
+            lv_obj_clear_flag(id(therm_now_tick), LV_OBJ_FLAG_HIDDEN);
+          }
+
+  # ── DUCKING ─────────────────────────────────────────────────────────────────────────────
+  # The music plays on the Office Sonos ACROSS THE ROOM, so the puck's mic hears Rihanna and
+  # the user at once: wake-word detection degrades and Whisper mis-hears ("stop" heard
+  # as "start" over music). AEC can't help — it cancels a device's OWN speaker, not another
+  # box across the room. Ducking is the fix every commercial smart speaker uses: drop the
+  # music the instant the wake word fires, restore on the way out.
+  #
+  # Restore MUST be reachable from EVERY exit path (on_end / on_error / watchdog / tap-to-stop)
+  # or the music stays quiet forever — a far worse bug than the one being fixed. `is_ducked`
+  # makes restore idempotent so calling it twice is harmless.
+  - id: duck_music
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(media_state).state == "playing" && !id(is_ducked);'
+          then:
+            - lambda: |-
+                id(pre_duck_vol) = id(sonos_volume).state;   // exact level, captured live
+                id(is_ducked) = true;
+                ESP_LOGI("duck", "ducking %.2f -> 0.12", id(pre_duck_vol));
+            - homeassistant.service:
+                service: media_player.volume_set
+                data:
+                  entity_id: "${media_player_ma}"
+                data_template:
+                  volume_level: "0.12"
+
+  - id: unduck_music
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(is_ducked);'
+          then:
+            - homeassistant.service:
+                service: media_player.volume_set
+                data:
+                  entity_id: "${media_player_ma}"
+                variables:
+                  vol: 'return id(pre_duck_vol);'
+                data_template:
+                  volume_level: "{{ vol }}"
+            - lambda: |-
+                ESP_LOGI("duck", "restored %.2f", id(pre_duck_vol));
+                id(is_ducked) = false;
+
+  # ── MODALS (doorbell / alert) ───────────────────────────────────────────────────────
+  # Both are INTERRUPTIONS, not pages: skip:true so they stay out of the tap cycle, they seize
+  # the screen from wherever you were, and they hand it back via return_to_prev_page. Auto-close
+  # matters more than it looks -- a modal that needs a tap to clear turns a doorbell into a
+  # screen that is stuck on a stranger's face until someone walks over.
+  # Both badges share the y:72 slot under the date. One visible -> centred; both -> side by
+  # side. lv_obj_align (not set_x) because the widgets are align:CENTER positioned.
+  - id: layout_badges
+    mode: single
+    then:
+      - lambda: |-
+          // pack the visible badges around centre: 1 -> 0 | 2 -> ∓16 | 3 -> -28,0,28
+          lv_obj_t *b[3] = {id(np_note), id(pkg_note), id(aqi_note)};
+          int vis[3], n = 0;
+          for (int i = 0; i < 3; i++)
+            if (!lv_obj_has_flag(b[i], LV_OBJ_FLAG_HIDDEN)) vis[n++] = i;
+          for (int k = 0; k < n; k++) {
+            int x = (n == 1) ? 0 : (n == 2 ? (k == 0 ? -16 : 16) : (k - 1) * 28);
+            lv_obj_align(b[vis[k]], LV_ALIGN_CENTER, x, 72);
+          }
+
+  - id: modal_hide
+    mode: single
+    then:
+      - lambda: 'id(modal_open) = 0;'
+      - script.execute: return_to_prev_page
+
+  - id: doorbell_show
+    mode: restart          # a second press re-arms the 45s window rather than stacking timers
+    parameters:
+      have_img: bool
+    then:
+      - lambda: 'id(modal_open) = 1;'
+      - if:
+          condition: {lambda: 'return have_img;'}
+          then:
+            - lvgl.widget.show: db_img
+            - lvgl.widget.hide: db_icon
+          else:
+            - lvgl.widget.hide: db_img
+            - lvgl.widget.show: db_icon
+      - lvgl.label.update:
+          id: db_title
+          text: !lambda 'return id(camera_title);'
+      - lvgl.label.update:
+          id: db_time
+          text: !lambda |-
+            auto t = id(homeassistant_time).now();
+            if (!t.is_valid()) return std::string("");
+            // Hand-rolled, NOT strftime("%-I:..."): %-I (unpadded hour) is a glibc extension
+            // that ESP-IDF's newlib rejects, and ESPHome's strftime wrapper renders its failure
+            // as the literal string "ERROR" on the panel .
+            int h = t.hour % 12; if (h == 0) h = 12;
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%d:%02d %s", h, t.minute, t.hour < 12 ? "AM" : "PM");
+            return std::string(buf);
+      - lvgl.page.show: doorbell_page
+      - delay: 45s
+      - script.execute: modal_hide
+
+  - id: alert_show
+    mode: restart
+    parameters:
+      title: string
+      message: string
+    then:
+      - lambda: 'id(modal_open) = 2;'
+      # reset to the GENERIC look every time — weather_alert_show restyles on top of this,
+      # and without the reset a plain phone alert would inherit the last storm's art
+      - lvgl.widget.hide: al_bg
+      - lvgl.widget.hide: al_wx_icon
+      - lvgl.widget.show: al_icon
+      - lvgl.widget.update: {id: al_scrim, bg_color: 0x2A1206, bg_opa: COVER}
+      - lvgl.label.update: {id: al_title, text: !lambda 'return title;'}
+      - lvgl.label.update: {id: al_msg,   text: !lambda 'return message;'}
+      - lvgl.page.show: alert_page
+      - delay: 60s
+      - script.execute: modal_hide
+
+  # ── TIMER ───────────────────────────────────────────────────────────────────────────────
+  - id: timer_show
+    mode: single
+    then:
+      - lambda: 'id(timer_done) = false;'
+      - lvgl.widget.hide: weather_icon
+      - lvgl.widget.hide: temp_out_text
+      - lvgl.widget.hide: low_label
+      - lvgl.label.update: {id: timer_label, text: "TIMER"}
+      - lambda: 'lv_obj_set_style_arc_color(id(timer_cover), lv_color_hex(0x23282F), LV_PART_MAIN);'
+      - lvgl.widget.show: timer_cover
+      - lvgl.widget.show: timer_label
+      - lvgl.widget.show: timer_value
+
+  # Hide the cover and the forecast underneath is ALREADY correct — nothing to restore.
+  # That's the whole point of masking instead of swapping.
+  - id: timer_hide
+    mode: single
+    then:
+      - lambda: 'id(timer_done) = false;'
+      - lvgl.widget.hide: timer_cover
+      - lvgl.widget.hide: timer_label
+      - lvgl.widget.hide: timer_value
+      - lvgl.widget.show: weather_icon
+      - lvgl.widget.show: temp_out_text
+      - lvgl.widget.show: low_label
+
+  - id: timer_finished_show
+    mode: restart
+    then:
+      - lambda: |-
+          id(timer_done) = true;
+          lv_arc_set_bg_angles(id(timer_cover), 270, 269);        // full circle
+          lv_obj_set_style_arc_color(id(timer_cover), lv_color_hex(0xFF5A3C), LV_PART_MAIN);
+      - lvgl.widget.show: timer_cover
+      - lvgl.label.update: {id: timer_label, text: "TIMER"}
+      - lvgl.label.update: {id: timer_value, text: "DONE"}
+      - lvgl.widget.show: timer_label
+      - lvgl.widget.show: timer_value
+      - lvgl.page.show: main_page      # a fired timer is worth interrupting whatever page you're on
+      - delay: 60s                     # self-clears if the user never taps
+      - script.execute: timer_hide
+
+  # VOICE WATCHDOG — the pipeline has NO timeout of its own. When no intent matches, HA hands the
+  # phrase to your conversation agent, which can chew for ~50s+ (the "World Cup tailspin") while the
+  # spinner sits there with no way out but a tap. This bounds it device-side.
+  #
+  # Scoped to the THINKING window on purpose: armed long at on_listening (backstop in case STT
+  # itself never returns), re-armed short at on_stt_end (the actual tailspin window), and CANCELLED
+  # at on_tts_start — once it's speaking, a long answer is legitimate and must not be killed.
+  # mode: restart means each arm supersedes the previous.
+  - id: va_watchdog
+    mode: restart
+    parameters:
+      secs: int
+    then:
+      - delay: !lambda 'return secs * 1000;'
+      - if:
+          condition:
+            lambda: 'return id(va_active);'
+          then:
+            - logger.log: "voice watchdog fired — aborting stuck pipeline"
+            - script.execute: unduck_music
+            - voice_assistant.stop:
+            - lvgl.widget.hide: va_tint_blue
+            - lvgl.widget.hide: va_tint_amber
+            - lvgl.widget.show: va_tint_teal
+            - lvgl.widget.update:
+                id: va_spin
+                indicator:
+                  arc_color: 0xFF6B6B
+            - lvgl.label.update: {id: va_reply, text: "Took too long — try again"}
+            - lvgl.widget.hide: va_hint
+            - delay: 2500ms
+            - lambda: 'id(va_active) = false;'
+            - script.execute: return_to_prev_page
+            - micro_wake_word.start:
+
+  # Return from the modal voice_page to whichever page the user was actually on (set by each page's
+  # on_load). LVGL has no "go back" action and page.previous walks the cycle order, not history —
+  # hence the explicit index. Used by on_end, on_error, and tap-to-stop.
+  - id: return_to_prev_page
+    then:
+      - if:
+          condition:
+            lambda: 'return id(current_page) == 1;'
+          then:
+            - lvgl.page.show: {id: thermostat_page, animation: MOVE_RIGHT, time: 200ms}
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(current_page) == 2;'
+                then:
+                  - lvgl.page.show: {id: media_page, animation: MOVE_RIGHT, time: 200ms}
+                else:
+                  - lvgl.page.show: {id: main_page, animation: MOVE_RIGHT, time: 200ms}
+
+  - id: adjust_thermostat
+    parameters:
+      delta: float
+    then:
+      - lambda: |-
+          float base = isnan(id(ui_target)) ? id(therm_target).state : id(ui_target);
+          if (isnan(base)) return;
+          float t = roundf(base + delta);
+          if (t < 50) t = 50;
+          if (t > 90) t = 90;
+          id(ui_target) = t;
+      - if:
+          condition:
+            lambda: 'return !isnan(id(ui_target));'
+          then:
+            - lvgl.label.update:
+                id: therm_target_label
+                text: !lambda 'return str_sprintf("%.0f°", id(ui_target));'
+            - script.execute: update_therm_ring   # optimistic: ring tracks the tap instantly
+            - homeassistant.action:
+                action: climate.set_temperature
+                data:
+                  entity_id: "${climate_entity}"
+                  temperature: !lambda 'return id(ui_target);'
+
+# ── M2: live clock + date from the RTC ──
+interval:
+  # Insurance: keep re-disabling CST816 auto-sleep every 2s (harmless while awake; re-arms after any
+  # chip reset/brownout). The boot write is primary; this catches edge cases so touch never goes sluggish.
+  - interval: 2s
+    then:
+      - lambda: 'id(my_touchscreen).write_byte(0xFE, 0x01);'
+
+  # WAKE-WORD SELF-HEAL + VISIBILITY. THE failure mode that matters on this device: every wake fires
+  # micro_wake_word.stop, and re-arming lives in on_end/on_error/watchdog/tap-to-stop. If ANY path
+  # ever misses (or an interaction dies in a way none of them catch), the puck goes permanently DEAF
+  # with no visible symptom — the clock keeps ticking and you just think it stopped hearing you.
+  # Arming is idempotent, so re-asserting it whenever it's off and no interaction is running is free.
+  # Also publishes the state so HA can SEE deafness rather than waiting for the user to notice.
+  - interval: 10s
+    then:
+      # also rescue a stuck duck: if no interaction is running but the music is still turned
+      # down, some exit path missed unduck_music and the user is left with quiet music forever.
+      - if:
+          condition:
+            lambda: 'return id(is_ducked) && !id(va_active);'
+          then:
+            - script.execute: unduck_music
+      - if:
+          condition:
+            micro_wake_word.is_running:
+          then:
+            - binary_sensor.template.publish: {id: mww_armed, state: true}
+          else:
+            - binary_sensor.template.publish: {id: mww_armed, state: false}
+            - if:
+                condition:      # only re-arm when idle — mid-interaction it's SUPPOSED to be off
+                  lambda: 'return !id(va_active);'
+                then:
+                  - logger.log: "wake-word self-heal: was idle but not armed — re-arming"
+                  - micro_wake_word.start:
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(rtc_time).now().is_valid();'
+          then:
+            - lvgl.label.update:
+                id: time_label
+                text: !lambda |-
+                  std::string s = id(rtc_time).now().strftime("%I:%M %p");
+                  if (!s.empty() && s[0] == '0') s.erase(0, 1);
+                  return s;
+            - lvgl.label.update:
+                id: date_label
+                text: !lambda |-
+                  std::string s = id(rtc_time).now().strftime("%A, %b %e");
+                  for (auto & c : s) c = toupper((unsigned char)c);
+                  return s;
+
+lvgl:
+  displays:
+    - main_display
+  touchscreens:
+    - my_touchscreen
+  # 180° so the puck reads right-side-up when the USB-C cable exits AWAY from the viewer.
+  # MUST be set HERE, not on the display, and the touchscreen transform MUST stay identity:
+  # LVGL owns rotation and auto-rotates touch coords to match. Setting display `rotation:`
+  # or adding touchscreen mirror_x/mirror_y on top would double-flip touch (picture right,
+  # tap zones inverted). Uses the panel's hardware rotation if available, else software.
+  rotation: 180
+  color_depth: 16
+  bg_color: 0x000000
+  page_wrap: true
+  # 25% buffer -> flushes in ~13ms quarters instead of one ~52ms full-frame push;
+  # keeps the main loop responsive so the HA API connection stays up (else time/data starve).
+  buffer_size: 25%
+  pages:
+    - id: main_page
+      on_load:
+        - lambda: 'id(current_page) = 0;'
+      widgets:
+        # ── weather background (full-screen) — swapped by ${weather_entity} condition ──
+        - image:
+            id: bg_main
+            src: wx_partlycloudy
+            align: CENTER
+            # native 300px, centered — the dark vignette fades to black before the bezel (no zoom:
+            # LVGL image transform stripes across the 25% draw buffer)
+        # ── forecast ring: 12 temperature segments (hour 0 = NOW at 12 o'clock, clockwise) ──
+        - arc:
+            id: ring_00
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 257
+            end_angle: 283
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - arc:
+            id: ring_01
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 287
+            end_angle: 313
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - arc:
+            id: ring_02
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 317
+            end_angle: 343
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - arc:
+            id: ring_03
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 347
+            end_angle: 13
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - arc:
+            id: ring_04
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 17
+            end_angle: 43
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - arc:
+            id: ring_05
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 47
+            end_angle: 73
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - arc:
+            id: ring_06
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 77
+            end_angle: 103
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - arc:
+            id: ring_07
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 107
+            end_angle: 133
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - arc:
+            id: ring_08
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 137
+            end_angle: 163
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - arc:
+            id: ring_09
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 167
+            end_angle: 193
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - arc:
+            id: ring_10
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 197
+            end_angle: 223
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - arc:
+            id: ring_11
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 227
+            end_angle: 253
+            arc_width: 13
+            arc_color: 0x2A3038
+            adjustable: false
+            value: 0
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        # ── TIMER COVER (the user's design) ────────────────────────────────────────────────
+        # A near-black arc drawn ON TOP of the 12 forecast segments. It spans the REMAINING
+        # fraction anchored at 12 o'clock, so as the timer counts down the cover peels back
+        # clockwise and REVEALS the forecast colour that was always underneath.
+        #
+        # Chosen over hide-the-forecast-and-restore-it, and over storing/swapping per-segment
+        # colours: this touches the forecast arcs NEVER. No stored state, nothing to restore,
+        # no exit path that can leave the ring wrong — hide the cover and what's beneath is
+        # already correct. It's also smooth (1s ticks = 0.4°/s on a 15min timer) instead of
+        # 12 chunky segment steps.
+        - arc:
+            id: timer_cover
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 270
+            end_angle: 269
+            arc_width: 13
+            arc_color: 0x23282F
+            adjustable: false
+            value: 0
+            hidden: true
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        # ── NOW tick: fixed marker just outside segment 0 ──
+        - obj:
+            id: now_tick
+            align: CENTER
+            x: 0
+            y: -170
+            width: 3
+            height: 9
+            radius: 1
+            bg_color: 0xFFFFFF
+            bg_opa: 90%
+            border_width: 0
+        # ── per-hour precip glyphs, in the annulus freed by centring the clock ──
+        - label:
+            id: px_00
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: 0
+            y: -136
+            text_color: 0x7FD4FF
+        - label:
+            id: px_01
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: 68
+            y: -118
+            text_color: 0x7FD4FF
+        - label:
+            id: px_02
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: 118
+            y: -68
+            text_color: 0x7FD4FF
+        - label:
+            id: px_03
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: 136
+            y: 0
+            text_color: 0x7FD4FF
+        - label:
+            id: px_04
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: 118
+            y: 68
+            text_color: 0x7FD4FF
+        - label:
+            id: px_05
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: 68
+            y: 118
+            text_color: 0x7FD4FF
+        - label:
+            id: px_06
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: 0
+            y: 136
+            text_color: 0x7FD4FF
+        - label:
+            id: px_07
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: -68
+            y: 118
+            text_color: 0x7FD4FF
+        - label:
+            id: px_08
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: -118
+            y: 68
+            text_color: 0x7FD4FF
+        - label:
+            id: px_09
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: -136
+            y: 0
+            text_color: 0x7FD4FF
+        - label:
+            id: px_10
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: -118
+            y: -68
+            text_color: 0x7FD4FF
+        - label:
+            id: px_11
+            text: ""
+            text_font: mdi_precip
+            align: CENTER
+            x: -68
+            y: -118
+            text_color: 0x7FD4FF
+        # ── outdoor NOW: condition glyph + temperature, sitting under segment 0 ──
+        - label:
+            id: weather_icon
+            text: "\U000F0590"
+            text_font: mdi_28
+            align: CENTER
+            y: -118
+            text_color: 0xFFFFFF
+        - label:
+            id: temp_out_text
+            text: "--°"
+            text_font: roboto_temp
+            align: CENTER
+            y: -80
+            text_color: 0xFFFFFF
+        # 12h low. Replaces the min/max labels that used to sit ON the ring — three similar-sized
+        # temperatures competing for the same glance was the worst part of the old design.
+        - label:
+            id: low_label
+            text: ""
+            text_font: roboto_tiny
+            align: CENTER
+            y: -52
+            text_color: 0x8FC8F5
+        # ── timer readout: occupies the outdoor-temp slot while a timer runs. A countdown is
+        #    urgent and temporary; the temperature is neither. The CLOCK keeps the centre —
+        #    this is a clock first, and a timer shouldn't rearrange its identity for 15 minutes.
+        - label:
+            id: timer_label
+            text: "TIMER"
+            text_font: roboto_tiny
+            align: CENTER
+            y: -110
+            text_color: 0x7FE9FF
+            hidden: true
+        - label:
+            id: timer_value
+            text: ""
+            text_font: roboto_time
+            align: CENTER
+            y: -76
+            text_color: 0xFFFFFF
+            hidden: true
+        # ── clock + date: DEAD CENTRE. This is what frees the whole annulus for the ring. ──
+        - label:
+            id: time_label
+            text: "--:--"
+            text_font: roboto_time
+            align: CENTER
+            y: -6
+            text_color: 0xFFFFFF
+        - label:
+            id: date_label
+            text: "--"
+            text_font: roboto_small
+            align: CENTER
+            y: 32
+            text_color: 0xE4EAF4
+        # ── music: PRESENCE ONLY. Song title lives one tap away on the media page; at 13px it was
+        #    unreadable from across the room anyway. Hidden when nothing is playing.
+        - label:
+            id: np_note
+            text: "\U000F075A"
+            text_font: mdi_note
+            align: CENTER
+            y: 72
+            text_color: 0xBFD5EC
+            hidden: true
+        # package badge — same presence-only contract as the note: the OPEN BOX means "a package
+        # is waiting", absence means none. Driven by input_boolean.package_waiting (Frigate's
+        # stock COCO model can't see packages; Frigate+ or any delivery integration flips the
+        # boolean later — the display side doesn't care who).
+        - label:
+            id: pkg_note
+            text: "\U000F03D6"
+            text_font: mdi_note
+            align: CENTER
+            y: 72
+            text_color: 0xF2D544
+            hidden: true
+        # air-quality badge (lungs): outdoor AQI > 100. Colour = EPA band (orange / red / purple).
+        # Fed by sensor.outdoor_aqi — Pirate Weather v2's airQualityIndex via a REST sensor;
+        # the HA integration doesn't expose it and it only exists with `?version=2`.
+        - label:
+            id: aqi_note
+            text: "\U000F1084"
+            text_font: mdi_note
+            align: CENTER
+            y: 72
+            text_color: 0xFF9F43
+            hidden: true
+    - id: thermostat_page
+      on_load:
+        - lambda: 'id(current_page) = 1;'
+      widgets:
+        - image:
+            id: thermo_bg
+            src: tm_cool
+            align: CENTER
+            # native 300px, centered (no zoom — see bg_main note)
+        # delta ring: the span between CURRENT and TARGET, coloured by mode. At setpoint the
+        # ring is EMPTY — calm means nothing to do, working means a visible gap closing. Dial
+        # maps 60–80°F onto 135°→405° (gap at the bottom clears the −/fan/+ hints).
+        - arc:
+            id: therm_ring
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 135
+            end_angle: 45
+            arc_width: 8
+            arc_color: 0x2A3038
+            arc_opa: 50%
+            adjustable: false
+            indicator:
+              arc_color: 0xFF9F43
+            knob:
+              bg_opa: TRANSP
+        # white tick = CURRENT temp. Same trick as the timer cover: an arc's BACKGROUND is a
+        # freely-positionable segment, so a ~4° bg drawn wider than the track reads as a tick
+        # straddling it.
+        - arc:
+            id: therm_now_tick
+            align: CENTER
+            width: 325
+            height: 325
+            start_angle: 135
+            end_angle: 139
+            arc_width: 14
+            arc_color: 0xE8EEF6
+            adjustable: false
+            hidden: true
+            indicator:
+              arc_opa: TRANSP
+            knob:
+              bg_opa: TRANSP
+        - label:
+            text: "UPSTAIRS"
+            text_font: roboto_tiny
+            align: TOP_MID
+            y: 40
+            text_color: 0xD5DEEC
+        - label:
+            id: therm_target_label
+            text: "--°"
+            text_font: roboto_big
+            align: CENTER
+            y: -22
+            text_color: 0xFFFFFF
+        - label:
+            id: therm_current_label
+            text: "CURRENTLY --°"
+            text_font: roboto_tiny
+            align: CENTER
+            y: 26
+            text_color: 0xBAC7DB
+        # bottom-zone hints: −  ·  fan(blue when running)  ·  +   (tap the third under each)
+        - label:
+            text: "\U000F0374"
+            text_font: mdi_btn
+            align: CENTER
+            x: -104
+            y: 96
+            text_color: 0x9AA6BB
+        - label:
+            id: fan_hint_icon
+            text: "\U000F0210"
+            text_font: mdi_btn
+            align: CENTER
+            x: 0
+            y: 96
+            text_color: 0x9AA6BB
+        - label:
+            text: "\U000F0415"
+            text_font: mdi_btn
+            align: CENTER
+            x: 104
+            y: 96
+            text_color: 0x9AA6BB
+    # ── MEDIA screen (3) — display only; the bottom tap-zones do vol−/play-pause/vol+ ──
+    - id: media_page
+      on_load:
+        - lambda: 'id(current_page) = 2;'
+      widgets:
+        # album art fills the screen (falls back to the glow when idle) — set at runtime
+        - image:
+            id: media_bg
+            src: bg_glow
+            align: CENTER
+        # full-screen shade: dims the album art so title/artist read clearly over any cover
+        - obj:
+            align: CENTER
+            width: 360
+            height: 360
+            radius: 0
+            border_width: 0
+            bg_color: 0x000000
+            bg_opa: 58%
+        # track progress — the annulus is this device's language: forecast (main), countdown
+        # (timer), setpoint (thermostat), and here: position in the song. Fed by
+        # sensor.smart_puck_track_progress (HA computes %, ~4x/min; smooth enough at 5px).
+        - arc:
+            id: media_ring
+            align: CENTER
+            width: 352
+            height: 352
+            start_angle: 270
+            end_angle: 269
+            arc_width: 5
+            arc_color: 0x2A3038
+            arc_opa: 45%
+            adjustable: false
+            min_value: 0
+            max_value: 100
+            value: 0
+            indicator:
+              arc_color: 0x7FE9FF
+            knob:
+              bg_opa: TRANSP
+        - label:
+            id: media_title_label
+            text: "Office"
+            text_font: roboto_media
+            align: CENTER
+            y: -18
+            width: 320
+            text_align: CENTER
+            long_mode: SCROLL_CIRCULAR
+            text_color: 0xFFFFFF
+        - label:
+            id: media_artist_label
+            text: ""
+            text_font: roboto_media
+            align: CENTER
+            y: 20
+            width: 300
+            text_align: CENTER
+            long_mode: SCROLL_CIRCULAR
+            text_color: 0xC2CDDE
+        # bottom-zone hints: vol−(F075E)  ·  play/pause (dynamic)  ·  vol+(F075D)
+        - label:
+            text: "\U000F075E"
+            text_font: mdi_btn
+            align: CENTER
+            x: -104
+            y: 96
+            text_color: 0x9AA6BB
+        - label:
+            id: media_action_icon
+            text: "\U000F040A"
+            text_font: mdi_btn
+            align: CENTER
+            x: 0
+            y: 96
+            text_color: 0x9AA6BB
+        - label:
+            text: "\U000F075D"
+            text_font: mdi_btn
+            align: CENTER
+            x: 104
+            y: 96
+            text_color: 0x9AA6BB
+    # ── VOICE view (Okay Nabu): neural bg + phase tint + spinner + transcript/reply; tap anywhere = stop ──
+    - id: doorbell_page
+      skip: true          # modal — seized on a bell press, never in the tap cycle
+      widgets:
+        # FULL-BLEED (v2, the user): the display is PHYSICALLY round, so filling the screen
+        # makes the glass itself the porthole — no radius/clip_corner software circle. v1 drew a
+        # 240px inset circle and my lv_image_set_offset_x pan overran the image data, leaving a
+        # straight-cut right edge. The container clips its child; the 640x360 frame sits at
+        # x=-140 so the CENTRE 360px band shows ((640-360)/2). Costs a bigger decode
+        # (~48KB vs ~23KB -> ~1s one-shot loop block at ring time, measured 509ms at 23KB).
+        - obj:
+            align: CENTER
+            width: 360
+            height: 360
+            radius: 0
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x000000
+            bg_opa: COVER
+            scrollable: false
+            widgets:
+              - image:
+                  id: db_img
+                  src: doorbell_snap
+                  x: -140
+                  y: 0
+              - label:
+                  id: db_icon
+                  text: "\U000F12E6"
+                  text_font: mdi_modal
+                  align: CENTER
+                  y: -20
+                  text_color: 0x7FE9FF
+                  hidden: true
+              # overlay strip: legibility scrim, not a panel — the photo stays the hero
+              - obj:
+                  align: BOTTOM_MID
+                  y: 0
+                  width: 360
+                  height: 92
+                  radius: 0
+                  border_width: 0
+                  pad_all: 0
+                  bg_color: 0x000000
+                  bg_opa: 55%
+                  scrollable: false
+              - label:
+                  id: db_title
+                  text: "Front door"
+                  text_font: roboto_small
+                  align: BOTTOM_MID
+                  y: -62
+                  text_color: 0xFFFFFF
+              - label:
+                  id: db_time
+                  text: ""
+                  text_font: roboto_small
+                  align: BOTTOM_MID
+                  y: -38
+                  text_color: 0x9FE6FF
+              - label:
+                  text: "TAP TO DISMISS"
+                  text_font: roboto_tiny
+                  align: BOTTOM_MID
+                  y: -16
+                  text_color: 0xB9C6DA
+
+    - id: alert_page
+      skip: true
+      widgets:
+        # weather art layer — shown ONLY for weather-kind alerts (storm/rain/snow/haze), so the
+        # modal is pretty when the sky is the message. Generic alerts (phone mirrors) keep the
+        # plain dark look: arbitrary text shouldn't wear sky art.
+        - image:
+            id: al_bg
+            src: wx_lightning
+            align: CENTER
+            hidden: true
+        - obj:
+            id: al_scrim
+            align: CENTER
+            width: 360
+            height: 360
+            radius: 0
+            border_width: 0
+            bg_color: 0x2A1206
+            bg_opa: COVER
+        - label:
+            id: al_icon
+            text: "\U000F0028"
+            text_font: mdi_modal
+            align: CENTER
+            y: -96
+            text_color: 0xFF9F43
+        - label:
+            id: al_wx_icon
+            text: "\U000F0593"
+            text_font: mdi_28
+            align: CENTER
+            y: -96
+            text_color: 0xFFFFFF
+            hidden: true
+        - label:
+            id: al_title
+            text: ""
+            text_font: roboto_label
+            align: CENTER
+            y: -28
+            width: 300
+            text_align: CENTER
+            long_mode: WRAP
+            text_color: 0xFFFFFF
+        - label:
+            id: al_msg
+            text: ""
+            text_font: roboto_small
+            align: CENTER
+            y: 46
+            width: 310
+            text_align: CENTER
+            long_mode: WRAP
+            text_color: 0xE4EAF4
+        - label:
+            text: "TAP TO DISMISS"
+            text_font: roboto_tiny
+            align: BOTTOM_MID
+            y: -14
+            text_color: 0x9AA6BB
+
+    - id: voice_page
+      skip: true          # modal — shown only during a voice interaction, not in the top-half tap cycle
+      widgets:
+        - image:
+            src: neural_bg
+            align: CENTER
+        - obj:
+            id: va_tint_blue
+            align: CENTER
+            width: 360
+            height: 360
+            radius: 0
+            border_width: 0
+            bg_color: 0x1E6FE0
+            bg_opa: 30%
+            hidden: true
+        - obj:
+            id: va_tint_amber
+            align: CENTER
+            width: 360
+            height: 360
+            radius: 0
+            border_width: 0
+            bg_color: 0xE0920F
+            bg_opa: 26%
+            hidden: true
+        - obj:
+            id: va_tint_teal
+            align: CENTER
+            width: 360
+            height: 360
+            radius: 0
+            border_width: 0
+            bg_color: 0x12B8A6
+            bg_opa: 26%
+            hidden: true
+        - spinner:
+            id: va_spin
+            align: CENTER
+            y: -80
+            width: 74
+            height: 74
+            spin_time: 1200ms
+            arc_length: 55deg
+            arc_color: 0x1B3A55
+            indicator:
+              arc_color: 0x7FE9FF
+        - label:
+            id: va_prompt
+            text: ""
+            text_font: roboto_media
+            align: CENTER
+            y: -28
+            width: 300
+            text_align: CENTER
+            long_mode: WRAP
+            text_color: 0x9FE6FF
+        - label:
+            id: va_reply
+            text: ""
+            text_font: roboto_media
+            align: CENTER
+            y: 30
+            width: 320
+            text_align: CENTER
+            long_mode: WRAP
+            text_color: 0xFFFFFF
+        - label:
+            id: va_hint
+            text: "TAP TO STOP"
+            text_font: roboto_tiny
+            align: BOTTOM_MID
+            y: -16
+            text_color: 0x9AA6BB
+            hidden: true

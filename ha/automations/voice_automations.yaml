@@ -1,0 +1,337 @@
+# TEMPLATE — import into HA and point the CAPITALIZED placeholders at your entities.
+# the puck voice automations — EXPORTED FROM HA for version control.
+# These were created via the HA config API, so they live in HA's /config/automations.yaml
+# and are NOT the source of truth — this file is a snapshot. Edit in HA (or via
+# ha_config_set_automation) and re-export; do not hand-edit and expect HA to pick it up.
+# Snapshot: 2 automation(s).
+- id: '1784227182223'
+  alias: Voice — Play music (Music Assistant)
+  description: 'Handles "play ..." from any Assist satellite via a SINGLE greedy sentence, then parses
+    in templates. ONE trigger/ONE sentence is deliberate: separate triggers for ''play {name}'' and ''play
+    {name} by {artist}'' BOTH match one utterance (wildcards are greedy), so HA fired twice and the runs
+    raced to play_media — wrong-song misfires .
+
+
+    Rules: ''the album X by Y'' -> album; ''the song/track X by Y'' -> track; bare ''X by Y'' -> TRACK
+    (the user''s default; X may be BOTH a song and an album, e.g. Umbrella / Good Girl Gone Bad); bare ''X''
+    -> artist catalogue on an exact match, else top track. Splits on the LAST '' by '' so titles containing
+    ''by'' survive. MA''s own search with name+artist qualifiers — the artist qualifier also excludes
+    the Phish.in provider, which returns ''Phish'' as result #1 for every query.
+
+
+    MATCH GUARD (added ): Whisper heard "Enter Sandman" as "inter sand" and this automation
+    confidently played "Interstate Love Song" — taking a garbage query and playing the nearest thing.
+    A device that confidently does the WRONG thing is worse than one that admits it didn''t understand.
+    So: score the result by how many of the query''s words actually appear in the result title (exact
+    tokens, punctuation stripped). Below 50% we refuse and say so. Substring matching was rejected — ''inter''
+    IS a substring of ''interstate'', which is exactly the false positive being fixed.
+
+
+    Success is SILENT (the music is the confirmation); only failures speak.'
+  triggers:
+  - trigger: conversation
+    command:
+    - play {query}
+  actions:
+  - choose:
+    - alias: Album explicitly requested
+      conditions:
+      - condition: template
+        value_template: '{{ want_album }}'
+      sequence:
+      - action: music_assistant.search
+        data:
+          config_entry_id: '{{ ma_entry }}'
+          name: '{{ q_name }}'
+          artist: '{{ q_artist }}'
+          media_type:
+          - album
+        response_variable: res
+      - variables:
+          hit: '{{ (res.albums | default([]) | first) if (res.albums | default([]) | count) > 0 else none
+            }}'
+          score: '{% if res.albums | default([]) | count == 0 or q_tokens | count == 0 %}0{% else %}{%
+            set rt = (res.albums[0].name | lower | regex_replace(''[^a-z0-9 ]'', '''')).split() %}{{ ((q_tokens
+            | select(''in'', rt) | list | count) / (q_tokens | count)) | round(2) }}{% endif %}'
+      - if:
+        - condition: template
+          value_template: '{{ hit is not none and (score | float(0)) >= 0.5 }}'
+        then:
+        - action: music_assistant.play_media
+          target:
+            entity_id: '{{ target_player }}'
+          data:
+            media_id: '{{ hit.uri }}'
+            media_type: album
+        - set_conversation_response: ''
+        else:
+        - set_conversation_response: I couldn't find the album {{ q_name }}.
+    - alias: Track — explicit song/track, or the bare 'X by Y' default
+      conditions:
+      - condition: template
+        value_template: '{{ want_track or q_artist != '''' }}'
+      sequence:
+      - action: music_assistant.search
+        data:
+          config_entry_id: '{{ ma_entry }}'
+          name: '{{ q_name }}'
+          artist: '{{ q_artist }}'
+          media_type:
+          - track
+        response_variable: res
+      - variables:
+          hit: '{{ (res.tracks | default([]) | first) if (res.tracks | default([]) | count) > 0 else none
+            }}'
+          score: '{% if res.tracks | default([]) | count == 0 or q_tokens | count == 0 %}0{% else %}{%
+            set rt = (res.tracks[0].name | lower | regex_replace(''[^a-z0-9 ]'', '''')).split() %}{{ ((q_tokens
+            | select(''in'', rt) | list | count) / (q_tokens | count)) | round(2) }}{% endif %}'
+      - if:
+        - condition: template
+          value_template: '{{ hit is not none and (score | float(0)) >= 0.5 }}'
+        then:
+        - action: music_assistant.play_media
+          target:
+            entity_id: '{{ target_player }}'
+          data:
+            media_id: '{{ hit.uri }}'
+            media_type: track
+        - set_conversation_response: ''
+        else:
+        - set_conversation_response: I couldn't find {{ q_name }}.
+    default:
+    - alias: Bare 'play X' — artist catalogue if exact match, else a well-matching top track
+      action: music_assistant.search
+      data:
+        config_entry_id: '{{ ma_entry }}'
+        name: '{{ q_name }}'
+        media_type:
+        - artist
+        - track
+      response_variable: res
+    - variables:
+        artist_uri: '{% set names = res.artists | default([]) | map(attribute=''name'') | map(''lower'')
+          | list %}{% set want = q_name | lower %}{{ res.artists[names.index(want)].uri if want in names
+          else '''' }}'
+        track_score: '{% if res.tracks | default([]) | count == 0 or q_tokens | count == 0 %}0{% else
+          %}{% set rt = (res.tracks[0].name | lower | regex_replace(''[^a-z0-9 ]'', '''')).split() %}{{
+          ((q_tokens | select(''in'', rt) | list | count) / (q_tokens | count)) | round(2) }}{% endif
+          %}'
+    - choose:
+      - alias: Exact artist match — play catalogue
+        conditions:
+        - condition: template
+          value_template: '{{ artist_uri != '''' }}'
+        sequence:
+        - action: music_assistant.play_media
+          target:
+            entity_id: '{{ target_player }}'
+          data:
+            media_id: '{{ artist_uri }}'
+            media_type: artist
+        - set_conversation_response: ''
+      - alias: Top track, but ONLY if it actually resembles what was asked for
+        conditions:
+        - condition: template
+          value_template: '{{ (res.tracks | default([]) | count) > 0 and (track_score | float(0)) >= 0.5
+            }}'
+        sequence:
+        - action: music_assistant.play_media
+          target:
+            entity_id: '{{ target_player }}'
+          data:
+            media_id: '{{ res.tracks[0].uri }}'
+            media_type: track
+        - set_conversation_response: ''
+      default:
+      - set_conversation_response: I couldn't find {{ q_name }}.
+  mode: queued
+  max: 5
+  variables:
+    ma_entry: YOUR_MA_CONFIG_ENTRY_ID
+    raw: '{{ trigger.slots.query | default('''') | trim }}'
+    low: '{{ (trigger.slots.query | default('''') | trim) | lower }}'
+    want_album: '{{ low.startswith(''the album '') or low.startswith(''album '') }}'
+    want_track: '{{ low.startswith(''the song '') or low.startswith(''song '') or low.startswith(''the
+      track '') or low.startswith(''track '') }}'
+    body: '{% if low.startswith(''the album '') %}{{ raw[10:] | trim }}{% elif low.startswith(''album
+      '') %}{{ raw[6:] | trim }}{% elif low.startswith(''the song '') %}{{ raw[9:] | trim }}{% elif low.startswith(''song
+      '') %}{{ raw[5:] | trim }}{% elif low.startswith(''the track '') %}{{ raw[10:] | trim }}{% elif
+      low.startswith(''track '') %}{{ raw[6:] | trim }}{% else %}{{ raw }}{% endif %}'
+    q_artist: '{% set p = body.split('' by '') %}{{ (p[-1] | trim) if (p | count) > 1 else '''' }}'
+    q_name: '{% set p = body.split('' by '') %}{{ ((p[:-1] | join('' by '')) | trim) if (p | count) >
+      1 else body }}'
+    q_tokens: '{{ (q_name | lower | regex_replace(''[^a-z0-9 ]'', '''')).split() }}'
+    target_player: '{% set area = area_id(trigger.device_id) if (trigger.device_id is defined and trigger.device_id)
+      else none %}{% set cands = (area_entities(area) if area else []) | select(''match'', ''media_player\.'')
+      | select(''in'', integration_entities(''music_assistant'')) | list %}{{ cands[0] if (cands | count)
+      > 0 else ''media_player.YOUR_SPEAKER_ma'' }}'
+- id: '1784245927340'
+  alias: Voice — Media controls (Office Sonos)
+  description: 'Every media-control phrase heard by an Assist satellite drives the Office Sonos (media_player.YOUR_SPEAKER_ma),
+    full stop. HA''s built-in media intents have to INFER a target from area + exposure + playing-state,
+    and they guess wrong: "stop" / "stop sonos" both failed with "I don''t know what you want
+    me to stop" while music was playing in the office. This device has one speaker and always will — so
+    hard-wire it instead of inferring.
+
+
+    NOTE ON TRIGGERS: these are all LITERAL sentences (no wildcards) except set-volume, so they cannot
+    overlap and double-fire. That matters — wildcard sentences ARE greedy, and two triggers matching one
+    utterance made the play handler fire twice and race itself (fixed ).
+
+
+    Success is SILENT. The music stopping IS the confirmation.'
+  triggers:
+  - trigger: conversation
+    id: pause
+    command:
+    - stop
+    - stop the music
+    - stop music
+    - stop the sonos
+    - stop sonos
+    - stop playing
+    - pause
+    - pause the music
+    - pause music
+    - pause the sonos
+    - shut up
+    - quiet
+  - trigger: conversation
+    id: resume
+    command:
+    - resume
+    - resume the music
+    - unpause
+    - continue
+    - continue the music
+    - keep playing
+    - play music
+    - start the music
+  - trigger: conversation
+    id: next
+    command:
+    - next
+    - next song
+    - next track
+    - skip
+    - skip this
+    - skip song
+    - skip this song
+  - trigger: conversation
+    id: prev
+    command:
+    - previous
+    - previous song
+    - previous track
+    - go back
+    - last song
+    - play that again
+    - restart the song
+  - trigger: conversation
+    id: louder
+    command:
+    - louder
+    - turn it up
+    - volume up
+    - turn up the volume
+    - turn up the music
+  - trigger: conversation
+    id: quieter
+    command:
+    - quieter
+    - turn it down
+    - volume down
+    - turn down the volume
+    - turn down the music
+  - trigger: conversation
+    id: setvol
+    command:
+    - set the volume to {level}
+    - set volume to {level}
+    - volume {level}
+  actions:
+  - choose:
+    - alias: Stop / pause
+      conditions:
+      - condition: trigger
+        id: pause
+      sequence:
+      - action: media_player.media_pause
+        target:
+          entity_id: '{{ sonos }}'
+      - set_conversation_response: ''
+    - alias: Resume
+      conditions:
+      - condition: trigger
+        id: resume
+      sequence:
+      - action: media_player.media_play
+        target:
+          entity_id: '{{ sonos }}'
+      - set_conversation_response: ''
+    - alias: Next track
+      conditions:
+      - condition: trigger
+        id: next
+      sequence:
+      - action: media_player.media_next_track
+        target:
+          entity_id: '{{ sonos }}'
+      - set_conversation_response: ''
+    - alias: Previous track
+      conditions:
+      - condition: trigger
+        id: prev
+      sequence:
+      - action: media_player.media_previous_track
+        target:
+          entity_id: '{{ sonos }}'
+      - set_conversation_response: ''
+    - alias: Louder — +10 points, clamped
+      conditions:
+      - condition: trigger
+        id: louder
+      sequence:
+      - action: media_player.volume_set
+        target:
+          entity_id: '{{ sonos }}'
+        data:
+          volume_level: '{{ [ (state_attr(sonos,''volume_level'') | float(0.3)) + 0.10, 1.0 ] | min |
+            round(2) }}'
+      - set_conversation_response: ''
+    - alias: Quieter — -10 points, clamped
+      conditions:
+      - condition: trigger
+        id: quieter
+      sequence:
+      - action: media_player.volume_set
+        target:
+          entity_id: '{{ sonos }}'
+        data:
+          volume_level: '{{ [ (state_attr(sonos,''volume_level'') | float(0.3)) - 0.10, 0.0 ] | max |
+            round(2) }}'
+      - set_conversation_response: ''
+    - alias: Set volume to N percent — the one wildcard; guarded against junk
+      conditions:
+      - condition: trigger
+        id: setvol
+      sequence:
+      - variables:
+          pct: '{{ trigger.slots.level | default('''') | regex_findall(''[0-9]+'') | first | default(-1)
+            | int }}'
+      - if:
+        - condition: template
+          value_template: '{{ pct >= 0 and pct <= 100 }}'
+        then:
+        - action: media_player.volume_set
+          target:
+            entity_id: '{{ sonos }}'
+          data:
+            volume_level: '{{ (pct / 100) | round(2) }}'
+        - set_conversation_response: ''
+        else:
+        - set_conversation_response: I didn't catch a volume between 0 and 100.
+  mode: queued
+  max: 5
+  variables:
+    sonos: media_player.YOUR_SPEAKER_ma

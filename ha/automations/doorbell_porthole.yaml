@@ -1,0 +1,31 @@
+# TEMPLATE — import into HA and point the CAPITALIZED placeholders at your entities.
+# EXPORTED FROM HA — snapshot for review/history. HA is the source of truth; edit there.
+id: '1784295569871'
+alias: Smart Puck — Doorbell porthole
+description: 'Front-door press -> the puck seizes its screen and shows a Frigate frame of whoever is there,
+  auto-closing after 45s.
+
+
+  WHY THE PUCK IS THE PASSIVE SIDE: HA owns the policy (what is worth interrupting for); the puck just
+  renders. Changing ''what triggers this'' should never need an OTA.
+
+
+  binary_sensor.YOUR_DOORBELL_PRESS is device_class OCCUPANCY, not a button press event -- it latches on
+  and back off. Trigger to:''on'' ONLY, or the release edge fires a second modal at nobody.
+
+
+  mode: single + a 10s cooldown: a doorbell gets mashed. Without this, each press restarts the 45s window
+  and re-downloads a frame, and repeated presses would hammer Frigate.'
+triggers:
+- trigger: state
+  entity_id: binary_sensor.YOUR_DOORBELL_PRESS
+  from: 'off'
+  to: 'on'
+conditions: []
+actions:
+- action: esphome.smart_puck_show_doorbell
+  data: {}
+- delay:
+    seconds: 10
+mode: single
+max_exceeded: silent

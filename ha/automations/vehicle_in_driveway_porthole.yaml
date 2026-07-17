@@ -1,0 +1,18 @@
+# TEMPLATE — import into HA and point the CAPITALIZED placeholders at your entities.
+# EXPORTED FROM HA — snapshot for review/history. HA is the source of truth; edit there.
+# NOTE: abbreviated snapshot — full description/templates live in HA.
+alias: Smart Puck — Vehicle in driveway porthole
+triggers:
+- trigger: state
+  entity_id: binary_sensor.YOUR_VEHICLE_SENSOR
+  from: 'off'
+  to: 'on'
+actions:
+- action: esphome.smart_puck_show_camera
+  data:
+    camera: driveway
+    title: Vehicle in driveway
+- delay:
+    minutes: 2
+mode: single
+max_exceeded: silent
