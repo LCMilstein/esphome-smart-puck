@@ -7,7 +7,8 @@ target. Edit in HA (or via `ha_config_set_automation`), then re-export here.
 |---|---|
 | `voice_automations.yaml` | Voice: play-music handler + hard-wired media controls |
 | `doorbell_porthole.yaml` | Doorbell press → puck shows a Frigate frame of the door |
-| `alert_modal.yaml` | Any notification sent to your phone → puck interrupt modal |
+| `alert_modal.yaml` | Phone-notification mirror → per-kind/per-tier puck modal (classifier, glyph sanitizer, runtime art) |
+| `conversation_goodbye.yaml` | Literal close-phrases end a conversation: spoken farewell + `dismiss` |
 
 ## Design note: the puck is the passive side
 

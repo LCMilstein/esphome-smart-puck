@@ -131,6 +131,19 @@ api:
             id: alert_show
             title: !lambda 'return title;'
             message: !lambda 'return message;'
+    # Clear whatever modal owns the screen and return to the default page — the API twin of
+    # the BOOT double-click. Lets HA close a conversation (goodbye flow) or retract an alert.
+    - action: dismiss
+      then:
+        - script.execute: hard_dismiss
+    # Open the mic WITHOUT a wake word — the listen half of system-initiated conversation
+    # ("how can I help?" ... *listens*). Same mechanism as push-to-talk, fired by an HA flow.
+    - action: converse_listen
+      then:
+        - lambda: 'id(conversing) = true;'
+        - script.execute: duck_music
+        - micro_wake_word.stop:
+        - voice_assistant.start:
     - action: show_weather_alert
       variables:
         kind: string
@@ -142,6 +155,25 @@ api:
             kind: !lambda 'return kind;'
             title: !lambda 'return title;'
             message: !lambda 'return message;'
+    # Thoughtful per-kind alert modal: kind picks the glyph (door/delivery/security/
+    # environment/fyi), tier picks the mood (ambient/notable/urgent — scrim, color, dwell),
+    # art_url (optional, may be "") fetches runtime art that overlays when it lands. As ever:
+    # HA owns the policy of what fires and at which tier; the firmware only knows how to look.
+    - action: show_kind_alert
+      variables:
+        kind: string
+        tier: string
+        title: string
+        message: string
+        art_url: string
+      then:
+        - script.execute:
+            id: kind_alert_show
+            kind: !lambda 'return kind;'
+            tier: !lambda 'return tier;'
+            title: !lambda 'return title;'
+            message: !lambda 'return message;'
+            art_url: !lambda 'return art_url;'
 
 ota:
   - platform: esphome
@@ -333,9 +365,11 @@ text_sensor:
           lv_obj_set_style_arc_color(id(therm_ring), lv_color_hex(c), LV_PART_INDICATOR);
       - script.execute: update_therm_ring
   # ── media player: playing state -> media mid-icon + main-screen now-playing visibility ──
+  # All the display feeds watch the MUSIC ASSISTANT entity: when MA owns the speaker's queue
+  # it's the entity whose attributes actually describe what's playing.
   - platform: homeassistant
     id: media_state
-    entity_id: "${media_player_native}"
+    entity_id: "${media_player_ma}"
     on_value:
       - lvgl.label.update:
           id: media_action_icon
@@ -345,25 +379,39 @@ text_sensor:
           then: [{lvgl.widget.show: np_note}]
           else: [{lvgl.widget.hide: np_note}]
       - script.execute: layout_badges
-      - if:   # media screen bg: keep album art while playing/paused, else revert to the glow
-          condition: {lambda: 'return x != std::string("playing") && x != std::string("paused");'}
-          then: [{lvgl.image.update: {id: media_bg, src: music_idle}}]
+      # STICKY DISPLAY (v3 — after v1/v2 both wiped the screen): the media page NEVER reverts
+      # on state transitions. MA flaps both state AND attributes mid-pause (frames with the
+      # title momentarily absent — observed live 3x), so no instantaneous signal is
+      # trustworthy. Instead: remember when music last PLAYED; a slow interval reverts to the
+      # vinyl only after 36h of silence — "resuming probably isn't happening."
+      - if:
+          condition: {lambda: 'return x == std::string("playing");'}
+          then:
+            - lambda: |-
+                auto t = id(homeassistant_time).now();
+                if (t.is_valid()) id(last_play_epoch) = (int) t.timestamp;
   - platform: homeassistant
     id: media_title
-    entity_id: "${media_player_native}"
+    entity_id: "${media_player_ma}"
     attribute: media_title
     on_value:
-      - lvgl.label.update:
-          id: media_title_label
-          text: !lambda 'return x.empty() ? std::string("Office") : x;'
+      - if:   # sticky: empty frames are MA transition noise, ignore them entirely
+          condition: {lambda: 'return !x.empty();'}
+          then:
+            - lvgl.label.update:
+                id: media_title_label
+                text: !lambda 'return x;'
   - platform: homeassistant
     id: media_artist
-    entity_id: "${media_player_native}"
+    entity_id: "${media_player_ma}"
     attribute: media_artist
     on_value:
-      - lvgl.label.update:
-          id: media_artist_label
-          text: !lambda 'return x;'
+      - if:   # sticky: ignore empty transition frames (same rule as the title)
+          condition: {lambda: 'return !x.empty();'}
+          then:
+            - lvgl.label.update:
+                id: media_artist_label
+                text: !lambda 'return x;'
   # ── FORECAST RING ──────────────────────────────────────────────────────────────────────
   # sensor.smart_puck_forecast_ring = 12 "temp:precip" pairs, hour 0 = NOW at 12 o'clock.
   #   "91:0,92:0,66:1,64:2,63:3,62:4,55:5,..."
@@ -483,8 +531,8 @@ text_sensor:
   # album-art URL (HA proxy path w/ signed token) -> fetch the cover into online_image
   - platform: homeassistant
     id: media_art_url
-    entity_id: "${media_player_native}"
-    attribute: entity_picture
+    entity_id: "${media_player_ma}"
+    attribute: entity_picture_local
     on_value:
       - if:
           condition: {lambda: 'return !x.empty();'}
@@ -777,13 +825,27 @@ voice_assistant:
     - delay: 400ms
     - micro_wake_word.start:
     - delay: 2600ms
-    - lambda: 'id(va_active) = false;'
+    - lambda: 'id(va_active) = false; id(conversing) = false;'
     - script.execute: return_to_prev_page
   on_error:
     - script.stop: va_watchdog
     - script.execute: unduck_music
     - micro_wake_word.start:
-    - lvgl.label.update: {id: va_reply, text: "Sorry — try again"}
+    - if:   # conversational silence is an ANSWER ("we're done"), not an error to apologize for
+        condition: {lambda: 'return id(conversing);'}
+        then:
+          - lambda: 'id(conversing) = false; id(va_active) = false;'
+          - if:
+              condition: {lambda: 'return id(modal_open) != 0;'}
+              then:
+                - script.stop: alert_show
+                - script.stop: weather_alert_show
+                - script.stop: kind_alert_show
+                - script.execute: modal_hide
+              else:
+                - script.execute: return_to_prev_page
+        else:
+          - lvgl.label.update: {id: va_reply, text: "Sorry — try again"}
     - lvgl.widget.hide: va_tint_blue
     - lvgl.widget.hide: va_tint_amber
     - lvgl.widget.show: va_tint_teal
@@ -864,6 +926,27 @@ online_image:
       # were the person at the door right now. A bell icon is honest; a wrong face is not.
       - script.execute: {id: doorbell_show, have_img: false}
 
+  # ── Kind-alert art: optional runtime-fetched artwork behind the per-kind alert modal ────
+  # Fetched on demand when show_kind_alert passes a non-empty art_url; arrives async and
+  # overlays the already-open modal via on_download_finished. Ship no art in firmware —
+  # generate per-install mood images (calm/notice/urgent, 360x360 JPEG) into HA's
+  # /config/www/smart-puck/alert-art/ and pass /local/smart-puck/alert-art/<mood>.jpg URLs.
+  # Resize must stay SERVER-side where possible (same blocking-decode caution as the doorbell).
+  - id: alert_art
+    url: "${ha_base_url}/"   # placeholder; real URL set at runtime by kind_alert_show
+    format: JPEG
+    type: RGB565
+    resize: 360x360
+    update_interval: never
+    on_download_finished:
+      - lvgl.image.update: {id: al_bg, src: alert_art}
+      - lvgl.widget.show: al_bg
+    on_error:
+      # Honest fallback, same philosophy as the doorbell: online_image RETAINS the previous
+      # download in its buffer, so showing al_bg here would dress THIS alert in the LAST
+      # alert's art. On error al_bg stays hidden and the modal keeps the glyph-only look.
+      - logger.log: "kind-alert art download FAILED - keeping glyph-only modal"
+
 font:
   - file:
       type: gfonts
@@ -910,7 +993,11 @@ font:
       weight: 500
     id: roboto_small
     size: 18
-    glyphs: " !\"#%&'()*+,-./0123456789:;°ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz·"
+    # Full printable ASCII + the typographic set (em/en dash, curly quotes, ellipsis, accents) —
+    # this font renders ARBITRARY alert text (phone mirrors, agent messages). The original list
+    # was missing ? $ < = > @ and all typography: "worth a glance — amber" boxed on the em-dash.
+    # Must stay a superset of roboto_label's set; the HA-side sanitizer strips the rest.
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_abcdefghijklmnopqrstuvwxyz{|}~°·’‘“”–—…éèêëáàâäíìîïóòôöúùûüñç"
   - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
     id: mdi_64
     size: 64
@@ -934,7 +1021,11 @@ font:
     # doorbell + alert-circle. Codepoints VERIFIED by ink-test against this exact webfont, not
     # read off a table -- MDI's meta.json ships codepoints newer than the pinned font, and a
     # glyph missing from the FONT renders as a silent tofu box (bitten 3x on this project).
-    glyphs: ["\U000F12E6", "\U000F0028"]
+    # Kind-alert glyphs below VERIFIED VISUALLY (rendered from the cached webfont to PNG and
+    # looked at; beware meta.json glyph names -- they lie in this pinned font):
+    #   F081A door (closed door w/ knob) | F03D7 delivery (closed package box)
+    #   F0498 security (solid shield) | F032A environment (leaf) | F02FD fyi (circled "i")
+    glyphs: ["\U000F12E6", "\U000F0028", "\U000F081A", "\U000F03D7", "\U000F0498", "\U000F032A", "\U000F02FD"]
   - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
     id: mdi_precip
     size: 12
@@ -1268,6 +1359,7 @@ touchscreen:
             - script.stop: doorbell_show   # kill the pending auto-close or it fires later
             - script.stop: alert_show      #   and yanks the user off a page he navigated to himself
             - script.stop: weather_alert_show
+            - script.stop: kind_alert_show
             - script.execute: modal_hide
             - lambda: 'id(tap_zone) = -1;'
       - if:   # A FIRED TIMER -> any tap dismisses it (and consumes the tap)
@@ -1341,7 +1433,10 @@ touchscreen:
               - lambda: 'return id(tap_zone) == 2;'
               - lvgl.page.is_showing: media_page
           then:
-            - homeassistant.action: {action: media_player.media_play_pause, data: {entity_id: "${media_player_native}"}}
+            # SMART play/pause via HA script (shipped in ha/smart_puck_package.yaml): on an
+            # MA-owned queue the NATIVE media_play silently no-ops, so the script drives the
+            # MA entity both directions — pause a live session, else RESUME the MA queue.
+            - homeassistant.action: {action: script.smart_puck_playpause, data: {}}
       # ── CLOCK screen: bottom-middle also toggles play/pause (taps the now-playing line) ──
       - if:
           condition:
@@ -1349,7 +1444,7 @@ touchscreen:
               - lambda: 'return id(tap_zone) == 2;'
               - lvgl.page.is_showing: main_page
           then:
-            - homeassistant.action: {action: media_player.media_play_pause, data: {entity_id: "${media_player_native}"}}
+            - homeassistant.action: {action: script.smart_puck_playpause, data: {}}  # same smart toggle as the media page
 
 globals:
   - id: ui_target          # on-device working target (NAN = follow HA); optimistic +/- feel
@@ -1403,6 +1498,14 @@ globals:
   - id: modal_open       # 0 none | 1 doorbell | 2 alert. An open modal OWNS the next tap
     type: int             # (dismiss) and must not also navigate -- same contract as timer_done.
     restore_value: no
+    initial_value: "0"
+  - id: conversing        # a system-initiated conversation is open: silence = graceful "we're
+    type: bool              # done", NOT the "Sorry — try again" error path.
+    restore_value: no
+    initial_value: "false"
+  - id: last_play_epoch   # last time the speaker session was PLAYING. Drives the 36h stale-out
+    type: int               # of the media page (keep the song screen through pauses; only
+    restore_value: yes      # revert when resuming is no longer likely).
     initial_value: "0"
   - id: spk_vol           # voice-reply volume step (BOOT long-press cycles 0.4/0.7/1.0).
     type: float             # Persisted: your volume choice should survive a reboot.
@@ -1525,6 +1628,7 @@ script:
       - script.stop: doorbell_show
       - script.stop: alert_show
       - script.stop: weather_alert_show
+      - script.stop: kind_alert_show
       - if:
           condition: {lambda: 'return id(modal_open) != 0;'}
           then: [{script.execute: modal_hide}]
@@ -1677,6 +1781,85 @@ script:
       - delay: 60s
       - script.execute: modal_hide
 
+  # ── THOUGHTFUL PER-KIND ALERT ──────────────────────────────────────────────────────────
+  # Deliberately does NOT wrap alert_show: that script hard-codes a 60s dwell and the generic
+  # red-scrim styling, both wrong here. Same widgets, its own mood: kind picks the glyph,
+  # tier picks scrim/color/dwell, optional art arrives async via alert_art. mode: restart so
+  # a newer alert replaces (and re-times) an older one instead of stacking dwell timers.
+  # NOTE: every new modal script must ALSO join every dismiss site's script.stop list
+  # (tap-on-modal, hard_dismiss, VA-conversing close) or its pending dwell fires later and
+  # yanks the user off a page they navigated to themselves.
+  - id: kind_alert_show
+    mode: restart
+    parameters:
+      kind: string
+      tier: string
+      title: string
+      message: string
+      art_url: string
+    then:
+      - lambda: 'id(modal_open) = 2;'
+      # reset to the glyph-only look; art (if any) overlays later via alert_art's callback
+      - lvgl.widget.hide: al_bg
+      - lvgl.widget.hide: al_wx_icon
+      - lvgl.widget.show: al_icon
+      - lvgl.label.update: {id: al_title, text: !lambda 'return title;'}
+      - lvgl.label.update: {id: al_msg,   text: !lambda 'return message;'}
+      # kind -> glyph (codepoints verified visually against the pinned webfont; see mdi_modal).
+      # Default first so an unknown kind gets the honest circled-i, not the last alert's glyph.
+      - lvgl.label.update: {id: al_icon, text: "\U000F02FD"}   # fyi / fallback: info
+      - if:
+          condition: {lambda: 'return kind == "door";'}
+          then: [{lvgl.label.update: {id: al_icon, text: "\U000F081A"}}]   # closed door
+      - if:
+          condition: {lambda: 'return kind == "delivery";'}
+          then: [{lvgl.label.update: {id: al_icon, text: "\U000F03D7"}}]   # package box
+      - if:
+          condition: {lambda: 'return kind == "security";'}
+          then: [{lvgl.label.update: {id: al_icon, text: "\U000F0498"}}]   # shield
+      - if:
+          condition: {lambda: 'return kind == "environment";'}
+          then: [{lvgl.label.update: {id: al_icon, text: "\U000F032A"}}]   # leaf
+      # tier -> mood. ambient = calm cool (never red/amber), notable = amber, urgent = alarm
+      # red and STICKY (no auto-dismiss; tap or hard_dismiss only). Unknown tier = notable.
+      - if:
+          condition: {lambda: 'return tier == "ambient";'}
+          then:
+            - lvgl.widget.update: {id: al_scrim, bg_color: 0x0B0E13, bg_opa: 55%}
+            - lvgl.label.update: {id: al_icon, text_color: 0x9FB8D8}
+      - if:
+          condition: {lambda: 'return tier == "urgent";'}
+          then:
+            - lvgl.widget.update: {id: al_scrim, bg_color: 0x2A1206, bg_opa: 65%}
+            - lvgl.label.update: {id: al_icon, text_color: 0xFF5A3C}
+      - if:
+          condition: {lambda: 'return tier != "ambient" && tier != "urgent";'}
+          then:
+            - lvgl.widget.update: {id: al_scrim, bg_color: 0x14100A, bg_opa: 60%}
+            - lvgl.label.update: {id: al_icon, text_color: 0xFF9F43}
+      # optional art: kick off the fetch, then show the page immediately — the download is
+      # async and dresses the already-open modal when (if) it lands.
+      - if:
+          condition: {lambda: 'return art_url.length() > 0;'}
+          then:
+            - online_image.set_url:
+                id: alert_art
+                url: !lambda 'return art_url;'
+            - component.update: alert_art
+      - lvgl.page.show: alert_page
+      # dwell AFTER the page is up. urgent falls through both ifs -> no modal_hide is ever
+      # scheduled -> sticky until tap / hard_dismiss (both script.stop this script anyway).
+      - if:
+          condition: {lambda: 'return tier == "ambient";'}
+          then:
+            - delay: 12s
+            - script.execute: modal_hide
+      - if:
+          condition: {lambda: 'return tier != "ambient" && tier != "urgent";'}
+          then:
+            - delay: 30s
+            - script.execute: modal_hide
+
   # ── TIMER ───────────────────────────────────────────────────────────────────────────────
   - id: timer_show
     mode: single
@@ -1813,6 +1996,24 @@ interval:
   # with no visible symptom — the clock keeps ticking and you just think it stopped hearing you.
   # Arming is idempotent, so re-asserting it whenever it's off and no interaction is running is free.
   # Also publishes the state so HA can SEE deafness rather than waiting for the user to notice.
+  # MEDIA STALE-OUT: the ONLY thing allowed to revert the media page to the generic vinyl
+  # screen. If nothing has PLAYED for 36h, resuming probably isn't happening — clear to idle
+  # art. Every faster signal (state flaps, absent attributes) proved untrustworthy.
+  - interval: 15min
+    then:
+      - if:
+          condition:
+            lambda: |-
+              auto t = id(homeassistant_time).now();
+              if (!t.is_valid() || id(last_play_epoch) == 0) return false;
+              if (id(media_state).state == "playing") return false;
+              return ((int) t.timestamp - id(last_play_epoch)) > 36 * 3600;
+          then:
+            - lvgl.image.update: {id: media_bg, src: music_idle}
+            - lvgl.label.update: {id: media_title_label, text: "Music"}
+            - lvgl.label.update: {id: media_artist_label, text: ""}
+            - lambda: 'id(last_play_epoch) = 0;'  # one-shot until music plays again
+
   - interval: 10s
     then:
       # also rescue a stuck duck: if no interaction is running but the music is still turned
@@ -2438,7 +2639,7 @@ lvgl:
               bg_opa: TRANSP
         - label:
             id: media_title_label
-            text: "Office"
+            text: "Music"
             text_font: roboto_media
             align: CENTER
             y: -18

@@ -27,9 +27,25 @@ custom firmware toolchain — one YAML file.
 - **Alert modals** — mirror phone notifications, or weather-dressed alerts (storm / rain /
   snow / haze art) including a device-side "rain incoming" edge trigger and an outdoor-AQI
   alert fed by Pirate Weather v2.
+- **Kind/tier alert modals** — a `show_kind_alert(kind, tier, title, message, art_url)`
+  action where the *kind* (door / delivery / security / environment / fyi) picks the glyph
+  and the *tier* picks the mood: **ambient** (calm scrim, 12 s), **notable** (amber, 30 s),
+  **urgent** (alarm red, sticky until dismissed). Optional artwork is fetched at runtime
+  from your HA `/local/` — generate your own mood images per install; on a failed fetch the
+  modal honestly keeps the glyph-only look. The included notify-mirror automation
+  classifies your phone notifications into kind/tier for free.
+- **Talks first** — a `converse_listen` action (mic open, no wake word) plus an HA converse
+  script make system-initiated conversation possible: the puck speaks via Sonos ANNOUNCE
+  (clip overlays the music and auto-restores), then listens; silence closes the exchange
+  gracefully, and literal goodbye phrases ("no thanks", "that's all") end it in
+  milliseconds. Build rituals on top — e.g. a once-daily presence-edge greeting.
 - **Thermostat + media pages** — tap to cycle. Thermostat shows a dial where the fill's
   leading edge is the room, the white tick is the target, and heating rises clockwise while
   cooling descends counter-clockwise. Media page shows album art with a track-progress ring.
+  Now-playing is **sticky**: Music Assistant's transition frames (empty titles mid-pause)
+  never wipe it; the page only reverts to idle art after 36 h without playback. The
+  play/pause tap drives a smart HA script that controls the Music Assistant entity in both
+  directions (native `media_play` silently no-ops on MA-owned queues).
 
 - **Side button (BOOT)** — the button furthest from USB-C: click = push-to-talk (no wake
   word), click again = cancel, double-click = dismiss any modal, long-press = voice volume
@@ -67,8 +83,8 @@ custom firmware toolchain — one YAML file.
 | Path | What |
 |---|---|
 | `smart-puck.yaml` | The entire device: display, touch, LVGL UI, voice, actions |
-| `ha/smart_puck_package.yaml` | HA-side feeds: forecast ring, track progress, outdoor AQI |
-| `ha/automations/` | Voice music handler, media controls, porthole + alert triggers |
+| `ha/smart_puck_package.yaml` | HA-side feeds + scripts: forecast ring, track progress, outdoor AQI, smart play/pause, converse |
+| `ha/automations/` | Voice music handler, media controls, porthole + alert triggers, goodbye |
 | `backgrounds/` | AI-generated art for weather / thermostat / voice states |
 | `GOTCHAS.md` | The traps this build hit so you don't have to |
 | `secrets.yaml.example` | Template for your credentials |

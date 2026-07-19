@@ -1,0 +1,58 @@
+# TEMPLATE — import into HA. Works as-is; tune the phrase list and farewells to taste.
+# EXPORTED FROM HA — snapshot for review/history. HA is the source of truth; edit there.
+id: '1784420095467'
+alias: Smart Puck — Conversation goodbye
+description: 'When the user declines further help, the exchange must CLOSE like a conversation —
+  spoken acknowledgment, a brief goodbye modal replacing whatever''s on screen, then back to the
+  default page.
+
+
+  WHY EXACT SENTENCES: custom conversation triggers OUTRANK a fallback conversation agent, so a
+  goodbye is answered in MILLISECONDS by the pipeline itself instead of round-tripping an LLM.
+  (The gap this closes: "no thank you" sat unacknowledged for seconds while the previous modal
+  lingered.) Spoken farewell varied via template; modal shows ~5s; the esphome `dismiss` action
+  returns the puck to its default page.
+
+
+  NOTE: the modal title must stay inside the puck fonts'' glyph coverage — an emoji title
+  renders as a tofu box on-device.'
+triggers:
+- trigger: conversation
+  command:
+  - no thank you
+  - no thanks
+  - no thanks bye
+  - nothing else
+  - nothing right now
+  - nothing else right now
+  - I'm good
+  - I'm all set
+  - that's all
+  - that's it
+  - that's all for now
+  - no not right now
+  - nope
+  - all good
+  - I don't need anything
+  - I don't need anything right now
+  - bye
+  - goodbye
+  - bye for now
+  - we're done
+  - that's everything
+conditions: []
+actions:
+- variables:
+    farewell: '{{ [''Ok. Let me know if you need anything.'', ''Bye for now.'', ''You got it — I''''m
+      around if you need me.'', ''Sounds good. Have a good one.''] | random }}'
+- set_conversation_response: '{{ farewell }}'
+- action: esphome.smart_puck_show_alert
+  data:
+    title: Goodbye
+    message: '{{ farewell }}'
+- delay:
+    seconds: 5
+- action: esphome.smart_puck_dismiss
+  data: {}
+mode: single
+max_exceeded: silent

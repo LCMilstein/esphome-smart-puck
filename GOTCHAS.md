@@ -53,3 +53,32 @@ automations. Changing policy must never require an OTA.
 | Rounded arc caps bridge gaps | LVGL arcs default to ROUNDED end caps; at large radius the caps visually bridge small inter-segment gaps and a segmented ring reads as solid. `arc_rounded: false` — also skips endcap anti-aliasing. |
 | Feels laggy | Check compiler first: ESPHome esp-idf defaults to `compiler_optimization: SIZE`; `PERF` (-O2) bought this device's LVGL loop back 20% for 2.5% flash. Then shorten page-slide animations — full-page redraws per frame dominate perceived lag. |
 | One assignable button | On this board BOOT (GPIO0) is a free runtime input (click/double/long via `on_multi_click`); the other button is RESET/power — firmware never sees it. Design for one button, not two. |
+| MA transition frames LIE | Music Assistant flaps both state AND attributes mid-pause: frames arrive with `media_title` momentarily EMPTY (observed live 3x). Any instantaneous "revert on empty/idle" logic wipes the now-playing screen mid-song. Labels accept only NON-EMPTY updates; the only revert is a slow stale-out interval (hours — 36h here), never a transition frame. |
+| Native play no-ops on MA-owned players | With Music Assistant owning the speaker's queue, NATIVE `media_play` silently no-ops (executes, state never moves — 0-for-2 live) while MA-entity play resumes every time. Drive the MA entity in BOTH directions via one HA script (`script.smart_puck_playpause`) and point every firmware tap at the script — never at `media_player.media_play_pause` on the native entity. |
+| Message-body fonts tofu | A font that renders ARBITRARY text (phone mirrors, agent messages) needs full printable ASCII **plus** the typographic set — em/en dash, curly quotes, ellipsis. A curated glyph list boxes on the first "worth a glance — amber". And sanitize HA-side: `regex_replace` away anything beyond the font's coverage (emoji!) before sending, keeping the char class in sync with the firmware glyph list. |
+| Sonos ANNOUNCE is invisible to state | `announce: true` clip playback NEVER appears in `media_player` state (verified live: state stayed `idle` mid-clip) — a `wait_for from: playing` dead-waits its full timeout. Time anything that follows speech off message LENGTH: ~13 chars/sec + 1s cushion, clamped. Upside of announce: the clip overlays the music and auto-restores; queue and resting volume untouched (`extra.volume` = clip-only volume). |
+| New modal script joins EVERY dismiss list | Every dismiss site (tap-on-modal, `hard_dismiss`, the conversing close) must `script.stop` EVERY modal script. A new modal kind added without joining those lists keeps its pending dwell alive — it fires later and yanks the user off a page they navigated to themselves. |
+| Conversational silence ≠ error | `voice_assistant.on_error` fires on dead air. In a SYSTEM-initiated conversation ("anything else?" … silence) that silence is the ANSWER, not a failure — gate the error path on a `conversing` flag and close gracefully (dismiss the modal, return to the page) instead of "Sorry — try again". |
+| Goodbye phrases outrank the fallback | Register close-phrases ("no thanks", "that's all", "bye") as LITERAL `conversation` triggers — custom sentences outrank the fallback conversation agent, so a goodbye is acknowledged in milliseconds instead of round-tripping an LLM while the modal lingers. |
+
+## System-initiated conversation (the converse primitive)
+
+The device can *start* a conversation, not just answer one. The whole pattern is three
+generic parts, all policy in HA:
+
+1. **`converse_listen` action** — opens the mic with NO wake word (the listen half of
+   "how can I help?" … *listens*). Firmware sets a `conversing` flag so the silence path
+   closes gracefully (see the table).
+2. **`script.smart_puck_converse`** (in `ha/smart_puck_package.yaml`) — show the text on
+   the puck, speak it via Sonos ANNOUNCE, delay by message length, then `converse_listen`.
+   Routed by where the *person* is: speech only when they're home and the room is occupied;
+   otherwise a phone push (a push can't listen).
+3. **Goodbye automation** (`ha/automations/conversation_goodbye.yaml`) — exact close-phrases
+   end the exchange like a conversation: spoken farewell, brief modal, `dismiss`.
+
+**Ritual concept:** any presence edge can open a conversation. Example shape — a
+once-per-day greeting: trigger on the room's occupancy going `off → on`, condition on the
+person actually being home (don't trust the room sensor alone — a laptop or a latch can
+fool it), guard once-a-day with `this.attributes.last_triggered`, then call the converse
+script with whatever your agent composes. All schedule/content policy stays in HA; the
+firmware only knows how to speak and listen.

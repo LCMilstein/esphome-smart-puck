@@ -132,3 +132,94 @@ rest:
         json_attributes_path: "$.currently"
         json_attributes:
           - smoke
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCRIPTS — the puck's HA-side hands. Point the living_room entities and the
+# YOUR_* placeholders at your install.
+# ─────────────────────────────────────────────────────────────────────────────
+script:
+  # SMART PLAY/PAUSE — what the puck's play button actually calls.
+  # Empirical basis: with Music Assistant owning the Sonos queue, NATIVE media_play
+  # silently no-ops (executed, state never moved — 0-for-2 in live tests) while MA-side
+  # media_play resumes every time (2-for-2). Native pause worked, but consistency wins:
+  # drive the MA entity in BOTH directions, exactly like the voice media controls do
+  # (MA sessions are controlled through the MA entity, full stop).
+  # playing → pause via the MA entity; anything else → play via the MA entity (resumes
+  # the MA queue — also covers the empty-native-queue case where native play has
+  # nothing to act on).
+  smart_puck_playpause:
+    alias: "Smart Puck play/pause (smart)"
+    mode: single
+    sequence:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: media_player.living_room_ma
+                state: "playing"
+            sequence:
+              - action: media_player.media_pause
+                target: {entity_id: media_player.living_room_ma}
+        default:
+          - action: media_player.media_play
+            target: {entity_id: media_player.living_room_ma}
+
+  # CONVERSE — speak-then-LISTEN, the system-initiated conversation primitive.
+  # Shows the text on the puck, speaks it on the room speaker, waits for the announcement
+  # to finish, then opens the puck's mic with NO wake word (esphome converse_listen).
+  # Whatever the user says flows through the normal Assist pipeline; silence closes the
+  # conversation gracefully (firmware `conversing` mode). Routed by WHERE THE USER IS,
+  # not by room state alone: speech only when the person is home AND the room is occupied
+  # (they can plausibly hear it); otherwise fall back to a phone push (a push can't listen).
+  #
+  # SPEECH = Sonos ANNOUNCE (audioClip) at a conversational clip volume — the clip plays
+  # OVER whatever is playing and auto-restores; the music queue and resting volume are
+  # never touched. Default 20 is conversational; resting volumes (~40) sound like a PA.
+  #
+  # THE DELAY IS LOAD-BEARING: announce/audioClip playback is INVISIBLE to media_player
+  # state (verified live — state stayed `idle` mid-clip), so a wait_for from:playing can
+  # NEVER work; it dead-waits its full timeout before the mic opens. Time the reply
+  # window off message length instead: ~13 chars/sec + 1s cushion, clamped 2–30s.
+  smart_puck_converse:
+    alias: "Smart Puck converse (speak, then listen)"
+    mode: queued
+    max: 3
+    fields:
+      title:
+        description: "Short title for the puck modal"
+        default: "Assistant"
+      message:
+        description: "What to say before listening"
+      volume:
+        description: "Speech volume 0-100 (announce clip only; resting volume untouched)"
+        default: 20
+    sequence:
+      - action: esphome.smart_puck_show_alert
+        data:
+          title: "{{ title | default('Assistant') }}"
+          message: "{{ message }}"
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: person.YOUR_PERSON
+                state: "home"
+              - condition: state
+                entity_id: binary_sensor.YOUR_ROOM_OCCUPANCY
+                state: "on"
+            sequence:
+              - action: media_player.play_media
+                target: {entity_id: media_player.living_room}
+                data:
+                  announce: true
+                  media_content_type: music
+                  media_content_id: "media-source://tts/tts.piper?message={{ message | urlencode }}"
+                  extra:
+                    volume: "{{ volume | default(20) | int }}"
+              # length-based reply window — see LOAD-BEARING note above
+              - delay: "{% set d = ((message | length) / 13) | round(0, 'ceil') | int + 1 %}{{ [2, [d, 30] | min] | max }}"
+              - action: esphome.smart_puck_converse_listen
+                data: {}
+        default:
+          - action: notify.mobile_app_YOUR_PHONE
+            data:
+              title: "{{ title | default('Assistant') }}"
+              message: "{{ message }}"

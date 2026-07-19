@@ -1,12 +1,12 @@
 # TEMPLATE — import into HA and point the CAPITALIZED placeholders at your entities.
 # EXPORTED FROM HA — snapshot for review/history. HA is the source of truth; edit there.
 id: '1784295613536'
-alias: Smart Puck — Alert modal
-description: 'Mirrors any notification sent to the user''s phone onto the puck as an interrupting modal (auto-closes
-  after 60s).
+alias: Smart Puck — Alert modal (kind/tier mirror)
+description: 'Mirrors any notification sent to the user''s phone onto the puck as a per-kind,
+  per-tier modal.
 
 
-  WHY call_service RATHER THAN A NEW EVENT: the user''s ask was ''anything already worth pinging my phone shows
+  WHY call_service RATHER THAN A NEW EVENT: the ask was ''anything already worth pinging my phone shows
   on the puck''. HA has no hook on notify.*, but it DOES fire a `call_service` event for every service
   call -- so this rides the EXISTING notify path with zero changes to the automations that send them.
   Nothing to remember to wire up later; new notifications get this for free.
@@ -15,13 +15,39 @@ description: 'Mirrors any notification sent to the user''s phone onto the puck a
   FILTERS, each load-bearing:
 
   - ''YOUR_NAME'' in service: your devices only. Other family members'' phone notifications have no business
-  seizing the office screen.
+  seizing this room''s screen.
 
   - message not starting ''command_''/''clear_notification'': the mobile_app notify service doubles as
   a REMOTE-CONTROL channel (command_dnd, command_broadcast_intent...). Those are not messages and would
   render as gibberish.
 
   - message length > 0: TTS/command payloads often carry an empty message.
+
+  - PRIVATE-KIND SUPPRESSION: one template condition per notification category you never want
+  mirrored to this screen (things you want on your phone but not announced to the room). Match a
+  keyword of your own alert vocabulary; the placeholder shows the pattern.
+
+
+  PORTHOLE SUPPRESSION: skip the mirror when ANY automation with ''porthole'' in its entity_id fired
+  within 20s -- the camera frame is already on screen and a text modal would steal the screen FROM it.
+  Matching the ''porthole'' NAMING CONVENTION means every future porthole automation gets suppression
+  for free -- keep the convention. The timing works because porthole automations trigger on the sensor
+  edge directly while this mirror rides the longer notify->script->call_service path.
+
+
+  GLYPH SANITIZER: title/message strip any char outside the puck fonts'' glyph coverage (printable
+  ASCII + the typographic set baked into roboto_small/roboto_label) BEFORE sending -- emoji and exotic
+  unicode in phone notifications render as tofu boxes on-device. Keep this filter''s char class in sync
+  with the firmware font glyphs.
+
+
+  KIND/TIER CLASSIFIER: renders via show_kind_alert instead of generic show_alert. Kind from message
+  keywords (delivery/door/security/environment, else fyi -- ''package|deliver'' checked BEFORE ''door''
+  so porch deliveries don''t classify as door); tier defaults NOTABLE, urgent only on genuinely alarming
+  words (urgent/alarm/intru/leak/smoke/co), ambient for FYI-ish; art = a tier mood jpg served from HA''s
+  /local/ (put your own calm.jpg/notice.jpg/urgent.jpg, 360x360, in /config/www/smart-puck/alert-art/ --
+  the art is fetched by the PUCK at runtime, so the URL must be reachable from the device). Per-kind art
+  upgrades happen HERE (swap art_url per kind), zero firmware changes.
 
 
   Truncated to 110 chars: the puck''s label wraps but the round screen has ~5 usable lines; a wall of
@@ -33,18 +59,38 @@ triggers:
     domain: notify
 conditions:
 - condition: template
-  value_template: >-
-    {% set ns = namespace(recent=false) %}{% for a in states.automation if 'porthole' in a.entity_id %}{% if a.attributes.last_triggered and (now() - a.attributes.last_triggered).total_seconds() < 20 %}{% set ns.recent = true %}{% endif %}{% endfor %}{{ not ns.recent }}
-- condition: template
   value_template: '{{ ''YOUR_NAME'' in (trigger.event.data.service | default('''') | lower) }}'
 - condition: template
   value_template: '{% set m = trigger.event.data.service_data.message | default('''') | string %}{{ m
     | length > 0 and not m.startswith(''command_'') and m != ''clear_notification'' }}'
+- condition: template
+  value_template: >-
+    {% set ns = namespace(recent=false) %}{% for a in states.automation if 'porthole' in a.entity_id %}{% if a.attributes.last_triggered and (now() - a.attributes.last_triggered).total_seconds() < 20 %}{% set ns.recent = true %}{% endif %}{% endfor %}{{ not ns.recent }}
+# PRIVATE-KIND SUPPRESSION — the pattern: one condition per category to keep off the room
+# screen. Duplicate this block per suppressed kind, matching a keyword from YOUR alert wording.
+- condition: template
+  value_template: '{% set m = trigger.event.data.service_data.message | default('''') | string | lower
+    %}{{ ''some-private-kind'' not in m }}'
 actions:
-- action: esphome.smart_puck_show_alert
+- variables:
+    a_kind: '{% set m = trigger.event.data.service_data.message | default('''') | string | lower %}{%
+      if ''package'' in m or ''deliver'' in m %}delivery{% elif ''door'' in m or ''gate'' in m or ''garage''
+      in m %}door{% elif ''alarm'' in m or ''security'' in m or ''lock'' in m or ''intru'' in m or ''person''
+      in m %}security{% elif ''weather'' in m or ''rain'' in m or ''storm'' in m or ''aqi'' in m or ''air
+      quality'' in m or ''wind'' in m %}environment{% else %}fyi{% endif %}'
+    a_tier: '{% set m = trigger.event.data.service_data.message | default('''') | string | lower %}{%
+      if ''urgent'' in m or ''alarm'' in m or ''intru'' in m or ''leak'' in m or ''smoke'' in m or ''co
+      '' in m %}urgent{% elif m.startswith(''fyi'') or ''all clear'' in m or ''completed'' in m %}ambient{%
+      else %}notable{% endif %}'
+- action: esphome.smart_puck_show_kind_alert
   data:
-    title: '{{ trigger.event.data.service_data.title | default(''Alert'') | string | truncate(40, True,
-      '''') }}'
-    message: '{{ trigger.event.data.service_data.message | string | truncate(110, True, ''…'') }}'
+    kind: '{{ a_kind }}'
+    tier: '{{ a_tier }}'
+    title: '{{ trigger.event.data.service_data.title | default(''Alert'') | string | regex_replace(''[^\x20-\x7E°·’‘“”–—…éèêëáàâäíìîïóòôöúùûüñç]'',
+      '''') | truncate(40, True, '''') }}'
+    message: '{{ trigger.event.data.service_data.message | string | regex_replace(''[^\x20-\x7E°·’‘“”–—…éèêëáàâäíìîïóòôöúùûüñç]'',
+      '''') | truncate(110, True, ''…'') }}'
+    art_url: 'http://homeassistant.local:8123/local/smart-puck/alert-art/{% if a_tier == ''urgent'' %}urgent{%
+      elif a_tier == ''ambient'' %}calm{% else %}notice{% endif %}.jpg'
 mode: queued
 max: 5
