@@ -98,7 +98,7 @@ api:
     - speaker.volume_set:
         id: i2s_speaker
         volume: !lambda 'return id(spk_vol);'
-    - micro_wake_word.start   # arm "Okay Nabu" once HA (Assist pipeline) is reachable
+    - script.execute: arm_wake_word   # arms only if the "Wake word" switch is on (ears may live on a dedicated satellite)
   # HA-callable actions. The puck is the passive side: HA decides WHAT is worth interrupting for
   # (doorbell press, an actionable notification) and calls in. Keeps policy in HA where the user can
   # see and edit it, rather than compiled into firmware behind an OTA.
@@ -685,6 +685,23 @@ spi:
   data_pins: [GPIO46, GPIO45, GPIO42, GPIO41]
 
 switch:
+  # EARS HANDOFF: hand wake-word duty to a dedicated satellite (e.g. an HA Voice PE) while this
+  # device keeps push-to-talk (BOOT click) + the converse reply-window mic — both of those call
+  # voice_assistant.start directly and ignore this switch by design. EVERY micro_wake_word.start
+  # site routes through the arm_wake_word gate script (gated on this switch) so the self-heal
+  # watchdog can't fight it. Revert = flip this switch in HA, zero reflash. RESTORE_DEFAULT_OFF
+  # remembers your choice across reboots (first ever boot = off — flip it ON in HA if this device
+  # should be the wake-word listener in your install).
+  - platform: template
+    name: "Wake word"
+    id: wake_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    turn_on_action:
+      - micro_wake_word.start:
+    turn_off_action:
+      - micro_wake_word.stop:
   - platform: gpio
     pin: GPIO18
     id: lcd_te
@@ -823,14 +840,14 @@ voice_assistant:
     # ended, while TTS audio was still releasing the mic, and silently failed. The self-heal is
     # the backstop; this is the actual fix attempt.
     - delay: 400ms
-    - micro_wake_word.start:
+    - script.execute: arm_wake_word
     - delay: 2600ms
     - lambda: 'id(va_active) = false; id(conversing) = false;'
     - script.execute: return_to_prev_page
   on_error:
     - script.stop: va_watchdog
     - script.execute: unduck_music
-    - micro_wake_word.start:
+    - script.execute: arm_wake_word
     - if:   # conversational silence is an ANSWER ("we're done"), not an error to apologize for
         condition: {lambda: 'return id(conversing);'}
         then:
@@ -1376,7 +1393,7 @@ touchscreen:
             - voice_assistant.stop:
             - lambda: 'id(va_active) = false; id(tap_zone) = -1;'
             - script.execute: return_to_prev_page
-            - micro_wake_word.start:
+            - script.execute: arm_wake_word
       - if:   # TOP HALF -> next screen
           condition: {lambda: 'return id(tap_zone) == 0;'}
           then:
@@ -1529,6 +1546,15 @@ globals:
     initial_value: "false"
 
 script:
+  # Sole gate for arming the wake word — every start site calls this instead of
+  # micro_wake_word.start so the wake_switch (ears-on-a-dedicated-satellite handoff) is
+  # honored by boot, VA re-arm paths, tap-to-stop, AND the self-heal watchdog alike.
+  - id: arm_wake_word
+    mode: single
+    then:
+      - if:
+          condition: {switch.is_on: wake_switch}
+          then: [{micro_wake_word.start:}]
   # ── WEATHER-STYLED ALERT ────────────────────────────────────────────────────────────────
   # Same modal, dressed for the message: the existing weather backgrounds + the matching
   # condition glyph, behind a light scrim. kind: storm | pouring | rain | snow | haze.
@@ -1614,7 +1640,7 @@ script:
             - voice_assistant.stop:
             - lambda: 'id(va_active) = false;'
             - script.execute: return_to_prev_page
-            - micro_wake_word.start:
+            - script.execute: arm_wake_word
           else:
             - script.execute: duck_music
             - micro_wake_word.stop:
@@ -1936,7 +1962,7 @@ script:
             - delay: 2500ms
             - lambda: 'id(va_active) = false;'
             - script.execute: return_to_prev_page
-            - micro_wake_word.start:
+            - script.execute: arm_wake_word
 
   # Return from the modal voice_page to whichever page the user was actually on (set by each page's
   # on_load). LVGL has no "go back" action and page.previous walks the cycle order, not history —
@@ -2031,11 +2057,13 @@ interval:
           else:
             - binary_sensor.template.publish: {id: mww_armed, state: false}
             - if:
-                condition:      # only re-arm when idle — mid-interaction it's SUPPOSED to be off
-                  lambda: 'return !id(va_active);'
+                condition:      # only re-arm when idle AND the ears are supposed to be ours —
+                                # with wake_switch off (a dedicated satellite is the ears) not-armed
+                                # is CORRECT, and without this gate the self-heal would log every interval
+                  lambda: 'return !id(va_active) && id(wake_switch).state;'
                 then:
                   - logger.log: "wake-word self-heal: was idle but not armed — re-arming"
-                  - micro_wake_word.start:
+                  - script.execute: arm_wake_word
   - interval: 1s
     then:
       - if:

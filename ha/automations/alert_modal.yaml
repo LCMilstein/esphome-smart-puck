@@ -47,7 +47,10 @@ description: 'Mirrors any notification sent to the user''s phone onto the puck a
   words (urgent/alarm/intru/leak/smoke/co), ambient for FYI-ish; art = a tier mood jpg served from HA''s
   /local/ (put your own calm.jpg/notice.jpg/urgent.jpg, 360x360, in /config/www/smart-puck/alert-art/ --
   the art is fetched by the PUCK at runtime, so the URL must be reachable from the device). Per-kind art
-  upgrades happen HERE (swap art_url per kind), zero firmware changes.
+  upgrades happen HERE (swap art_url per kind), zero firmware changes -- e.g. a parcel still-life for
+  delivery, a threshold shot for door. A LIVE CAMERA FRAME URL is a valid art_url too (e.g. your porch
+  camera''s latest-frame endpoint on delivery alerts); the firmware''s online_image on_error path keeps
+  the glyph-only fallback, so a dead camera can never show a stale frame.
 
 
   Truncated to 110 chars: the puck''s label wraps but the round screen has ~5 usable lines; a wall of

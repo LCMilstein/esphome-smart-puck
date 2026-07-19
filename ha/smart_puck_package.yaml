@@ -163,22 +163,23 @@ script:
           - action: media_player.media_play
             target: {entity_id: media_player.living_room_ma}
 
-  # CONVERSE — speak-then-LISTEN, the system-initiated conversation primitive.
-  # Shows the text on the puck, speaks it on the room speaker, waits for the announcement
-  # to finish, then opens the puck's mic with NO wake word (esphome converse_listen).
-  # Whatever the user says flows through the normal Assist pipeline; silence closes the
-  # conversation gracefully (firmware `conversing` mode). Routed by WHERE THE USER IS,
-  # not by room state alone: speech only when the person is home AND the room is occupied
-  # (they can plausibly hear it); otherwise fall back to a phone push (a push can't listen).
+  # CONVERSE — speak-then-LISTEN, the system-initiated conversation primitive (ONE-VOICE shape).
+  # Shows the text on the puck (the face), then does the whole spoken half with a SINGLE native
+  # call: `assist_satellite.start_conversation` with `start_message` speaks the message on an
+  # Assist satellite (e.g. an HA Voice PE) AND opens its reply window in one step — the reply
+  # flows through the normal Assist pipeline; silence closes the exchange gracefully.
+  # `preannounce: true` plays the satellite's chime first so speech doesn't start cold.
   #
-  # SPEECH = Sonos ANNOUNCE (audioClip) at a conversational clip volume — the clip plays
-  # OVER whatever is playing and auto-restores; the music queue and resting volume are
-  # never touched. Default 20 is conversational; resting volumes (~40) sound like a PA.
+  # This REPLACES the previous chain (media_player announce → length-based delay →
+  # esphome converse_listen). No announce timing math, no second mic to manage — and your
+  # music speaker goes back to being MUSIC ONLY. The old chain is still the fallback shape
+  # if you have no assist_satellite entity: see GOTCHAS.md ("historical" rows) for its two
+  # load-bearing quirks (announce invisible to state; length-based delay).
   #
-  # THE DELAY IS LOAD-BEARING: announce/audioClip playback is INVISIBLE to media_player
-  # state (verified live — state stayed `idle` mid-clip), so a wait_for from:playing can
-  # NEVER work; it dead-waits its full timeout before the mic opens. Time the reply
-  # window off message length instead: ~13 chars/sec + 1s cushion, clamped 2–30s.
+  # Routed by WHERE THE USER IS, not by room state alone: speech only when the person is
+  # home AND the room is occupied (they can plausibly hear it); otherwise fall back to a
+  # phone push (a push can't listen). AVAILABILITY GUARD: if the satellite is unavailable/
+  # unknown, speaking would silently no-op — fall back to the phone push instead.
   smart_puck_converse:
     alias: "Smart Puck converse (speak, then listen)"
     mode: queued
@@ -189,9 +190,6 @@ script:
         default: "Assistant"
       message:
         description: "What to say before listening"
-      volume:
-        description: "Speech volume 0-100 (announce clip only; resting volume untouched)"
-        default: 20
     sequence:
       - action: esphome.smart_puck_show_alert
         data:
@@ -206,18 +204,26 @@ script:
                 entity_id: binary_sensor.YOUR_ROOM_OCCUPANCY
                 state: "on"
             sequence:
-              - action: media_player.play_media
-                target: {entity_id: media_player.living_room}
-                data:
-                  announce: true
-                  media_content_type: music
-                  media_content_id: "media-source://tts/tts.piper?message={{ message | urlencode }}"
-                  extra:
-                    volume: "{{ volume | default(20) | int }}"
-              # length-based reply window — see LOAD-BEARING note above
-              - delay: "{% set d = ((message | length) / 13) | round(0, 'ceil') | int + 1 %}{{ [2, [d, 30] | min] | max }}"
-              - action: esphome.smart_puck_converse_listen
-                data: {}
+              - choose:
+                  - conditions:
+                      - condition: not
+                        conditions:
+                          - condition: state
+                            entity_id: assist_satellite.YOUR_SATELLITE_ENTITY
+                            state:
+                              - unavailable
+                              - unknown
+                    sequence:
+                      - action: assist_satellite.start_conversation
+                        target: {entity_id: assist_satellite.YOUR_SATELLITE_ENTITY}
+                        data:
+                          start_message: "{{ message }}"
+                          preannounce: true
+                default:
+                  - action: notify.mobile_app_YOUR_PHONE
+                    data:
+                      title: "{{ title | default('Assistant') }}"
+                      message: "{{ message }}"
         default:
           - action: notify.mobile_app_YOUR_PHONE
             data:

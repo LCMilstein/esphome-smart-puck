@@ -56,7 +56,13 @@ automations. Changing policy must never require an OTA.
 | MA transition frames LIE | Music Assistant flaps both state AND attributes mid-pause: frames arrive with `media_title` momentarily EMPTY (observed live 3x). Any instantaneous "revert on empty/idle" logic wipes the now-playing screen mid-song. Labels accept only NON-EMPTY updates; the only revert is a slow stale-out interval (hours — 36h here), never a transition frame. |
 | Native play no-ops on MA-owned players | With Music Assistant owning the speaker's queue, NATIVE `media_play` silently no-ops (executes, state never moves — 0-for-2 live) while MA-entity play resumes every time. Drive the MA entity in BOTH directions via one HA script (`script.smart_puck_playpause`) and point every firmware tap at the script — never at `media_player.media_play_pause` on the native entity. |
 | Message-body fonts tofu | A font that renders ARBITRARY text (phone mirrors, agent messages) needs full printable ASCII **plus** the typographic set — em/en dash, curly quotes, ellipsis. A curated glyph list boxes on the first "worth a glance — amber". And sanitize HA-side: `regex_replace` away anything beyond the font's coverage (emoji!) before sending, keeping the char class in sync with the firmware glyph list. |
-| Sonos ANNOUNCE is invisible to state | `announce: true` clip playback NEVER appears in `media_player` state (verified live: state stayed `idle` mid-clip) — a `wait_for from: playing` dead-waits its full timeout. Time anything that follows speech off message LENGTH: ~13 chars/sec + 1s cushion, clamped. Upside of announce: the clip overlays the music and auto-restores; queue and resting volume untouched (`extra.volume` = clip-only volume). |
+| HISTORICAL — Sonos ANNOUNCE is invisible to state | `announce: true` clip playback NEVER appears in `media_player` state (verified live: state stayed `idle` mid-clip) — a `wait_for from: playing` dead-waits its full timeout. Still true, but OBSOLETED here: the converse script now uses `assist_satellite.start_conversation` (see below), which needs no announce and no wait at all. Only relevant if you have no assist_satellite and must fall back to the announce chain. |
+| HISTORICAL — length-based reply delay | The old announce→listen chain timed the reply window off message LENGTH (~13 chars/sec + cushion, clamped) because announce playback is invisible to state. Two failure modes even when tuned: the window can open on the announce TAIL (the mic transcribes your own speaker), and it's guesswork per TTS voice. OBSOLETED by `start_conversation(start_message)` — native speak-then-listen, zero timing math. |
+| `start_conversation` = native speak-then-listen | `assist_satellite.start_conversation` with `start_message` speaks AND opens the reply window in ONE call on an Assist satellite — it replaces entire announce+delay+listen chains. `preannounce: true` chimes first. Guard on the satellite not being `unavailable`/`unknown` (else it silently no-ops) and fall back to a phone push. |
+| Pipelines answer where they heard | HA Assist pipelines respond ON THE SATELLITE THAT HEARD YOU. With multiple mics in a room (display device + voice satellite), decide the ears / voice / face roles DELIBERATELY — otherwise which speaker answers depends on which mic won the race. |
+| Two open mics = double capture | Two devices listening on the same wake word (or one wake mic + one open reply window) = ONE utterance captured TWICE = duplicate pipeline runs, duplicate intent execution. Hand wake duty to exactly one device (see the ears-handoff switch) and never leave a second reply window open across another device's capture. |
+| Agent "can't answer" = exposure, usually | LLM conversation agents only see entities EXPOSED to Assist (Settings → Voice assistants → Expose). "The agent can't answer X" is usually an exposure gap, not model intelligence — check exposure before blaming (or swapping) the model. |
+| STT quality gates everything | The STT model gates the whole voice UX: base/int8 Whisper shreds conversational speech (a fine wake-word demo becomes an unusable conversation partner). Prefer `distil-small.en` or better for the pipeline you actually talk to; spend the accuracy budget on STT before anything else. |
 | New modal script joins EVERY dismiss list | Every dismiss site (tap-on-modal, `hard_dismiss`, the conversing close) must `script.stop` EVERY modal script. A new modal kind added without joining those lists keeps its pending dwell alive — it fires later and yanks the user off a page they navigated to themselves. |
 | Conversational silence ≠ error | `voice_assistant.on_error` fires on dead air. In a SYSTEM-initiated conversation ("anything else?" … silence) that silence is the ANSWER, not a failure — gate the error path on a `conversing` flag and close gracefully (dismiss the modal, return to the page) instead of "Sorry — try again". |
 | Goodbye phrases outrank the fallback | Register close-phrases ("no thanks", "that's all", "bye") as LITERAL `conversation` triggers — custom sentences outrank the fallback conversation agent, so a goodbye is acknowledged in milliseconds instead of round-tripping an LLM while the modal lingers. |
@@ -66,15 +72,29 @@ automations. Changing policy must never require an OTA.
 The device can *start* a conversation, not just answer one. The whole pattern is three
 generic parts, all policy in HA:
 
-1. **`converse_listen` action** — opens the mic with NO wake word (the listen half of
-   "how can I help?" … *listens*). Firmware sets a `conversing` flag so the silence path
-   closes gracefully (see the table).
-2. **`script.smart_puck_converse`** (in `ha/smart_puck_package.yaml`) — show the text on
-   the puck, speak it via Sonos ANNOUNCE, delay by message length, then `converse_listen`.
-   Routed by where the *person* is: speech only when they're home and the room is occupied;
-   otherwise a phone push (a push can't listen).
+1. **`script.smart_puck_converse`** (in `ha/smart_puck_package.yaml`) — show the text on
+   the puck (the face), then ONE native call does the spoken half:
+   `assist_satellite.start_conversation` with `start_message` + `preannounce` speaks on an
+   Assist satellite and opens its reply window in the same step. Routed by where the
+   *person* is: speech only when they're home and the room is occupied; satellite
+   unavailable → phone push (a push can't listen).
+2. **`converse_listen` action** — opens THIS device's mic with NO wake word. The fallback
+   listen-leg if you have no assist_satellite entity (pair it with the historical
+   announce+delay chain in the table), or the natural choice when the puck itself holds
+   wake-word duty. Firmware sets a `conversing` flag so the silence path closes gracefully.
 3. **Goodbye automation** (`ha/automations/conversation_goodbye.yaml`) — exact close-phrases
    end the exchange like a conversation: spoken farewell, brief modal, `dismiss`.
+
+## Ears handoff (multi-satellite rooms)
+
+When a dedicated voice satellite (e.g. an HA Voice PE) joins the room, hand it wake-word
+duty instead of running two open mics: the firmware's HA-exposed **"Wake word" template
+switch** (`RESTORE_DEFAULT_OFF`) gates EVERY `micro_wake_word.start` site through one
+`arm_wake_word` script — boot, both voice re-arm paths, tap-to-stop, AND the self-heal
+watchdog (which is also condition-gated, so ears-off doesn't log a "re-arming" line every
+interval). Push-to-talk and `converse_listen` bypass the gate by design — the display
+device keeps its button mic. Revert = flip one switch in HA, no reflash. Decide the roles
+explicitly: satellite = ears + voice, display device = face + push-to-talk.
 
 **Ritual concept:** any presence edge can open a conversation. Example shape — a
 once-per-day greeting: trigger on the room's occupancy going `off → on`, condition on the

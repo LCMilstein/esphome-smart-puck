@@ -15,6 +15,11 @@ custom firmware toolchain — one YAML file.
   with a full-screen voice UI (listening/thinking/speaking states), music **ducking** while
   it listens, a watchdog so a hung pipeline can't wedge the screen, and a self-heal loop
   that re-arms the wake word if it ever silently dies.
+- **Ears handoff** — an HA-exposed **"Wake word" switch** hands wake-word duty to a
+  dedicated satellite (e.g. an HA Voice PE) while this device keeps push-to-talk and the
+  converse mic. Every wake-word arm site (including the self-heal) routes through one
+  gate script, so flipping the switch is the whole story — revert is one switch flip, no
+  reflash. Ships OFF: flip it ON in HA if this device should be the wake-word listener.
 - **Voice music that actually works** — HA automations (included) that own the "play X /
   play X by Y" sentence, search Music Assistant with artist qualifiers, and refuse to play
   garbage when speech-to-text mishears (token-overlap match guard).
@@ -31,14 +36,20 @@ custom firmware toolchain — one YAML file.
   action where the *kind* (door / delivery / security / environment / fyi) picks the glyph
   and the *tier* picks the mood: **ambient** (calm scrim, 12 s), **notable** (amber, 30 s),
   **urgent** (alarm red, sticky until dismissed). Optional artwork is fetched at runtime
-  from your HA `/local/` — generate your own mood images per install; on a failed fetch the
-  modal honestly keeps the glyph-only look. The included notify-mirror automation
-  classifies your phone notifications into kind/tier for free.
-- **Talks first** — a `converse_listen` action (mic open, no wake word) plus an HA converse
-  script make system-initiated conversation possible: the puck speaks via Sonos ANNOUNCE
-  (clip overlays the music and auto-restores), then listens; silence closes the exchange
-  gracefully, and literal goodbye phrases ("no thanks", "that's all") end it in
-  milliseconds. Build rituals on top — e.g. a once-daily presence-edge greeting.
+  from any URL the device can reach — per-tier mood images from HA's `/local/` are the
+  starting point, and swapping `art_url` **per kind** in the automation is the upgrade path
+  (a parcel still-life for delivery, a threshold for door, …) with zero firmware changes.
+  A **live camera frame URL is a valid `art_url`** too (e.g. a porch camera for delivery
+  alerts); on any failed fetch — including a dead camera — the modal honestly keeps the
+  glyph-only look, never a stale frame. The included notify-mirror automation classifies
+  your phone notifications into kind/tier for free.
+- **Talks first** — system-initiated conversation: the included HA converse script shows
+  the text on the puck, then a single `assist_satellite.start_conversation` call speaks it
+  on your Assist satellite AND opens the reply window natively (no announce timing math —
+  your music speaker stays music-only). Silence closes the exchange gracefully, and literal
+  goodbye phrases ("no thanks", "that's all") end it in milliseconds. A `converse_listen`
+  action (this device's mic, no wake word) remains for satellite-less installs. Build
+  rituals on top — e.g. a once-daily presence-edge greeting.
 - **Thermostat + media pages** — tap to cycle. Thermostat shows a dial where the fill's
   leading edge is the room, the white tick is the target, and heating rises clockwise while
   cooling descends counter-clockwise. Media page shows album art with a track-progress ring.
